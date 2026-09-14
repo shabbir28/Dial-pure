@@ -23,14 +23,14 @@ async function seed() {
   if (!adminId) {
     adminId = uuid();
     await query(
-      `INSERT INTO users (id, user_code, first_name, last_name, email, password_hash, role, status)
-       VALUES (?, ?, 'System', 'Admin', 'admin@gmail.com', ?, 'admin', 'active')`,
+      `INSERT INTO users (id, user_code, username, first_name, last_name, email, password_hash, role, status)
+       VALUES (?, ?, 'admin', 'System', 'Admin', 'admin@gmail.com', ?, 'admin', 'active')`,
       [adminId, 'ADM-1', adminHash]
     );
-    console.log('Created admin: admin@gmail.com / admin123');
+    console.log('Created admin: admin@gmail.com / admin123 (username: admin)');
   } else {
     await query(
-      `UPDATE users SET email = 'admin@gmail.com', password_hash = ?, status = 'active' WHERE id = ?`,
+      `UPDATE users SET username = 'admin', email = 'admin@gmail.com', password_hash = ?, status = 'active' WHERE id = ?`,
       [adminHash, adminId]
     );
     console.log('Updated admin: admin@gmail.com / admin123');
@@ -44,14 +44,14 @@ async function seed() {
   if (!agentId) {
     agentId = uuid();
     await query(
-      `INSERT INTO users (id, user_code, first_name, last_name, email, password_hash, role, status, created_by)
-       VALUES (?, ?, 'John', 'Agent', 'agent@gmail.com', ?, 'agent', 'active', ?)`,
+      `INSERT INTO users (id, user_code, username, first_name, last_name, email, password_hash, role, status, created_by)
+       VALUES (?, ?, 'agent', 'John', 'Agent', 'agent@gmail.com', ?, 'agent', 'active', ?)`,
       [agentId, 'AGT-1', agentHash, adminId]
     );
-    console.log('Created agent: agent@gmail.com / agent123');
+    console.log('Created agent: agent@gmail.com / agent123 (username: agent)');
   } else {
     await query(
-      `UPDATE users SET email = 'agent@gmail.com', password_hash = ?, status = 'active' WHERE id = ?`,
+      `UPDATE users SET username = 'agent', email = 'agent@gmail.com', password_hash = ?, status = 'active' WHERE id = ?`,
       [agentHash, agentId]
     );
     console.log('Updated agent: agent@gmail.com / agent123');
