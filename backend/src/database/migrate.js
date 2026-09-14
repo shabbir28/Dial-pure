@@ -48,6 +48,8 @@ async function migrate() {
     const extraIndexes = [
       ['campaign_numbers', 'idx_campaign_numbers_hash', 'CREATE INDEX idx_campaign_numbers_hash ON campaign_numbers (phone_hash)'],
       ['scrub_rows', 'idx_scrub_rows_hash', 'CREATE INDEX idx_scrub_rows_hash ON scrub_rows (phone_hash)'],
+      ['internal_list_numbers', 'idx_iln_hash', 'CREATE INDEX idx_iln_hash ON internal_list_numbers (phone_hash)'],
+      ['global_dnc_dead_numbers', 'idx_gdnc_num_hash', 'CREATE INDEX idx_gdnc_num_hash ON global_dnc_dead_numbers (phone_hash)'],
     ];
     for (const [table, indexName, sql] of extraIndexes) {
       const [found] = await admin.query(

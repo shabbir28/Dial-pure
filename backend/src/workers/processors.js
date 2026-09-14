@@ -1294,9 +1294,8 @@ async function processInternalList({
   const seenHashes = new Set();
   const pending = [];
 
-  // Internal-list import tuning.
-  // 5,000 rows per single INSERT statement reduces round-trips by 5x.
-  const INTERNAL_INSERT_BATCH = 5000;
+  // Internal-list import tuning: batch inserts with disabled constraint checks.
+  const INTERNAL_INSERT_BATCH = 2500;
   const INTERNAL_PROGRESS_EVERY = 25000;
 
   const conn = await getPool().getConnection();
@@ -1305,6 +1304,7 @@ async function processInternalList({
 
   try {
     await conn.execute('SET foreign_key_checks = 0');
+    await conn.execute('SET unique_checks = 0');
     await conn.beginTransaction();
     inTransaction = true;
 
@@ -1472,6 +1472,7 @@ async function processInternalList({
       await conn.commit();
       inTransaction = false;
     }
+    await conn.execute('SET unique_checks = 1');
     await conn.execute('SET foreign_key_checks = 1');
 
     const unique = uniqueInserted;
@@ -1546,6 +1547,7 @@ async function processInternalList({
     if (inTransaction) {
       try { await conn.rollback(); } catch {}
     }
+    try { await conn.execute('SET unique_checks = 1'); } catch {}
     try { await conn.execute('SET foreign_key_checks = 1'); } catch {}
 
     await query(
@@ -1565,6 +1567,7 @@ async function processInternalList({
 
     throw error;
   } finally {
+    try { await conn.execute('SET unique_checks = 1'); } catch {}
     try { await conn.execute('SET foreign_key_checks = 1'); } catch {}
     conn.release();
   }
@@ -1590,7 +1593,7 @@ async function processGlobalDnc({ versionId, fileId, phoneColumn, actorId, reque
   const seenHashes = new Set();
   const pending = [];
 
-  const INTERNAL_INSERT_BATCH = 5000;
+  const INTERNAL_INSERT_BATCH = 2500;
   const INTERNAL_PROGRESS_EVERY = 25000;
 
   const conn = await getPool().getConnection();
@@ -1599,6 +1602,7 @@ async function processGlobalDnc({ versionId, fileId, phoneColumn, actorId, reque
 
   try {
     await conn.execute('SET foreign_key_checks = 0');
+    await conn.execute('SET unique_checks = 0');
     await conn.beginTransaction();
     inTransaction = true;
 
@@ -1724,6 +1728,7 @@ async function processGlobalDnc({ versionId, fileId, phoneColumn, actorId, reque
       await conn.commit();
       inTransaction = false;
     }
+    await conn.execute('SET unique_checks = 1');
     await conn.execute('SET foreign_key_checks = 1');
 
     const unique = uniqueInserted;
@@ -1770,6 +1775,7 @@ async function processGlobalDnc({ versionId, fileId, phoneColumn, actorId, reque
     });
   } catch (error) {
     if (inTransaction) { try { await conn.rollback(); } catch {} }
+    try { await conn.execute('SET unique_checks = 1'); } catch {}
     try { await conn.execute('SET foreign_key_checks = 1'); } catch {}
 
     await query(
@@ -1782,6 +1788,7 @@ async function processGlobalDnc({ versionId, fileId, phoneColumn, actorId, reque
     );
     throw error;
   } finally {
+    try { await conn.execute('SET unique_checks = 1'); } catch {}
     try { await conn.execute('SET foreign_key_checks = 1'); } catch {}
     conn.release();
   }

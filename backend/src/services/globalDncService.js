@@ -30,11 +30,16 @@ async function validateUpload(file) {
 }
 
 /**
- * Get the current active global DNC/Dead version info.
+ * Get the current active global DNC/Dead version info with file and uploader details.
  */
 async function getGlobalDncSummary() {
   const versions = await query(
-    `SELECT * FROM global_dnc_dead_versions ORDER BY created_at DESC LIMIT 10`
+    `SELECT g.*, f.original_filename, f.file_size_bytes,
+            u.first_name, u.last_name, u.email
+     FROM global_dnc_dead_versions g
+     LEFT JOIN files f ON f.id = g.source_file_id
+     LEFT JOIN users u ON u.id = g.created_by
+     ORDER BY g.created_at DESC LIMIT 50`
   );
   const active = versions.find((v) => v.status === 'active') || null;
   return { active, recent: versions };
