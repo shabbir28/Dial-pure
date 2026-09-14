@@ -11,6 +11,7 @@ import {
   History,
   FileText,
   FileSpreadsheet,
+  Loader2,
 } from 'lucide-react';
 
 import api from '../services/api';
@@ -160,8 +161,12 @@ export default function InternalDncDead() {
 
   const active = summary?.active || null;
   const recent = summary?.recent || [];
-  const isProcessing = active?.status === 'processing' || recent.some((v) => v.status === 'processing');
-  const percent = progress(active);
+  const processing =
+    summary?.processing ||
+    recent.find((v) => v.status === 'processing') ||
+    (active?.status === 'processing' ? active : null);
+  const isProcessing = Boolean(processing);
+  const percent = progress(processing || active);
 
   const filteredHistory = useMemo(() => {
     if (historyFilter === 'active') return recent.filter((v) => v.status === 'active');
@@ -205,6 +210,129 @@ export default function InternalDncDead() {
           </Button>
         </div>
       </div>
+
+      {/* Live Processing Card */}
+      {processing && (
+        <div
+          className="card"
+          style={{
+            marginBottom: 24,
+            padding: '20px 24px',
+            border: '1px solid rgba(217, 119, 6, 0.35)',
+            background: 'linear-gradient(180deg, rgba(217, 119, 6, 0.08) 0%, rgba(217, 119, 6, 0.02) 100%)',
+            borderRadius: 12,
+            boxShadow: '0 4px 20px rgba(217, 119, 6, 0.08)',
+          }}
+        >
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              marginBottom: 16,
+              flexWrap: 'wrap',
+              gap: 12,
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              <div
+                style={{
+                  width: 42,
+                  height: 42,
+                  borderRadius: 10,
+                  background: 'rgba(217, 119, 6, 0.15)',
+                  border: '1px solid rgba(217, 119, 6, 0.3)',
+                  display: 'grid',
+                  placeItems: 'center',
+                  color: 'var(--color-warning, #d97706)',
+                }}
+              >
+                <Loader2 size={22} style={{ animation: 'spin 1.5s linear infinite' }} />
+              </div>
+              <div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <h3 style={{ margin: 0, fontSize: '1.05rem', fontWeight: 700 }}>
+                    Processing New DNC / Dead List (v{processing.version_number})
+                  </h3>
+                  <StatusBadge value="processing" />
+                </div>
+                <p className="page-sub" style={{ margin: '2px 0 0', fontSize: '0.78rem' }}>
+                  {processing.original_filename ? (
+                    <>Source: <strong>{processing.original_filename}</strong> · </>
+                  ) : null}
+                  Parsing phone numbers and importing into database. Will auto-activate on completion.
+                </p>
+              </div>
+            </div>
+
+            <div style={{ textAlign: 'right' }}>
+              <div style={{ fontSize: '1.6rem', fontWeight: 800, color: 'var(--color-warning, #d97706)', lineHeight: 1 }}>
+                {percent}%
+              </div>
+              <div style={{ fontSize: '0.76rem', opacity: 0.7, marginTop: 2 }}>
+                {formatNumber(processing.processed_rows)} / {formatNumber(processing.total_rows)} rows
+              </div>
+            </div>
+          </div>
+
+          {/* Progress Bar */}
+          <div
+            style={{
+              height: 10,
+              width: '100%',
+              borderRadius: 999,
+              background: 'var(--color-border)',
+              overflow: 'hidden',
+              marginBottom: 16,
+            }}
+          >
+            <div
+              style={{
+                height: '100%',
+                width: `${Math.max(percent, 2)}%`,
+                background: 'linear-gradient(90deg, #f59e0b 0%, #10b981 100%)',
+                transition: 'width .35s ease',
+              }}
+            />
+          </div>
+
+          {/* Real-time breakdown metrics */}
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))',
+              gap: 12,
+            }}
+          >
+            <div style={{ background: 'var(--color-surface)', padding: '10px 14px', borderRadius: 8, border: '1px solid var(--color-border)' }}>
+              <span className="page-sub" style={{ fontSize: '0.72rem', textTransform: 'uppercase' }}>Processed</span>
+              <div style={{ marginTop: 2 }}>
+                <strong style={{ fontSize: '1.15rem' }}>{formatNumber(processing.processed_rows)}</strong>
+              </div>
+            </div>
+            <div style={{ background: 'var(--color-surface)', padding: '10px 14px', borderRadius: 8, border: '1px solid var(--color-border)' }}>
+              <span className="page-sub" style={{ fontSize: '0.72rem', textTransform: 'uppercase' }}>Valid Numbers</span>
+              <div style={{ marginTop: 2 }}>
+                <strong style={{ fontSize: '1.15rem', color: 'var(--color-success)' }}>{formatNumber(processing.valid_numbers)}</strong>
+              </div>
+            </div>
+            <div style={{ background: 'var(--color-surface)', padding: '10px 14px', borderRadius: 8, border: '1px solid var(--color-border)' }}>
+              <span className="page-sub" style={{ fontSize: '0.72rem', textTransform: 'uppercase' }}>Duplicates</span>
+              <div style={{ marginTop: 2 }}>
+                <strong style={{ fontSize: '1.15rem', opacity: 0.85 }}>{formatNumber(processing.duplicate_numbers)}</strong>
+              </div>
+            </div>
+            <div style={{ background: 'var(--color-surface)', padding: '10px 14px', borderRadius: 8, border: '1px solid var(--color-border)' }}>
+              <span className="page-sub" style={{ fontSize: '0.72rem', textTransform: 'uppercase' }}>Invalid</span>
+              <div style={{ marginTop: 2 }}>
+                <strong style={{ fontSize: '1.15rem', color: Number(processing.invalid_numbers) > 0 ? 'var(--color-danger)' : 'inherit' }}>
+                  {formatNumber(processing.invalid_numbers)}
+                </strong>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Active version display */}
       {loadingSummary ? (
@@ -311,27 +439,6 @@ export default function InternalDncDead() {
               </div>
             </div>
           </div>
-
-          {/* Progress bar if processing */}
-          {active.status === 'processing' && (
-            <div style={{ marginTop: 16 }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
-                <span className="page-sub">Processing list...</span>
-                <strong>{percent}%</strong>
-              </div>
-              <div style={{ height: 9, width: '100%', borderRadius: 999, background: 'var(--color-border)', overflow: 'hidden' }}>
-                <div style={{
-                  height: '100%',
-                  width: `${Math.max(percent, 2)}%`,
-                  background: 'var(--color-success)',
-                  transition: 'width .3s ease',
-                }} />
-              </div>
-              <div className="page-sub" style={{ marginTop: 6, fontSize: '.8rem' }}>
-                {formatNumber(active.processed_rows)} / {formatNumber(active.total_rows)} rows
-              </div>
-            </div>
-          )}
         </div>
       ) : (
         <div
@@ -485,7 +592,13 @@ export default function InternalDncDead() {
                       </span>
                     </td>
                     <td style={{ textAlign: 'right', fontWeight: 600 }}>
-                      {formatNumber(item.total_rows)}
+                      {item.status === 'processing' ? (
+                        <span title="Total rows detected">
+                          {formatNumber(item.total_rows || item.processed_rows || 0)}
+                        </span>
+                      ) : (
+                        formatNumber(item.total_rows)
+                      )}
                     </td>
                     <td
                       style={{
@@ -494,7 +607,13 @@ export default function InternalDncDead() {
                         color: item.unique_numbers > 0 ? 'var(--color-primary)' : 'inherit',
                       }}
                     >
-                      {formatNumber(item.unique_numbers)}
+                      {item.status === 'processing' ? (
+                        <span style={{ color: 'var(--color-warning, #d97706)', fontWeight: 600, fontSize: '0.82rem' }}>
+                          {formatNumber(item.valid_numbers || item.processed_rows || 0)} parsed
+                        </span>
+                      ) : (
+                        formatNumber(item.unique_numbers)
+                      )}
                     </td>
                     <td style={{ textAlign: 'right', opacity: 0.75 }}>
                       {formatNumber(item.duplicate_numbers)}
@@ -503,22 +622,46 @@ export default function InternalDncDead() {
                       {formatNumber(item.invalid_numbers)}
                     </td>
                     <td>
-                      <StatusBadge value={item.status} />
-                      {item.status === 'failed' && item.failure_reason && (
-                        <div
-                          style={{
-                            fontSize: '0.72rem',
-                            color: '#b42318',
-                            marginTop: 2,
-                            maxWidth: 180,
-                            whiteSpace: 'nowrap',
-                            overflow: 'hidden',
-                            textOverflow: 'ellipsis',
-                          }}
-                          title={item.failure_reason}
-                        >
-                          {item.failure_reason}
+                      {item.status === 'processing' ? (
+                        <div style={{ minWidth: 130 }}>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                            <StatusBadge value="processing" />
+                            <strong style={{ fontSize: '0.76rem', color: 'var(--color-warning, #d97706)' }}>
+                              {progress(item)}%
+                            </strong>
+                          </div>
+                          <div style={{ height: 6, width: '100%', borderRadius: 999, background: 'var(--color-border)', overflow: 'hidden' }}>
+                            <div style={{
+                              height: '100%',
+                              width: `${Math.max(progress(item), 3)}%`,
+                              background: 'var(--color-warning, #d97706)',
+                              transition: 'width .3s ease',
+                            }} />
+                          </div>
+                          <div style={{ fontSize: '0.7rem', opacity: 0.75, marginTop: 2 }}>
+                            {formatNumber(item.processed_rows)} / {formatNumber(item.total_rows)}
+                          </div>
                         </div>
+                      ) : (
+                        <>
+                          <StatusBadge value={item.status} />
+                          {item.status === 'failed' && item.failure_reason && (
+                            <div
+                              style={{
+                                fontSize: '0.72rem',
+                                color: '#b42318',
+                                marginTop: 2,
+                                maxWidth: 180,
+                                whiteSpace: 'nowrap',
+                                overflow: 'hidden',
+                                textOverflow: 'ellipsis',
+                              }}
+                              title={item.failure_reason}
+                            >
+                              {item.failure_reason}
+                            </div>
+                          )}
+                        </>
                       )}
                     </td>
                     <td style={{ fontSize: '0.82rem', opacity: 0.85 }}>

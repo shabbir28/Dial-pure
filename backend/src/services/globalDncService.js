@@ -42,7 +42,8 @@ async function getGlobalDncSummary() {
      ORDER BY g.created_at DESC LIMIT 50`
   );
   const active = versions.find((v) => v.status === 'active') || null;
-  return { active, recent: versions };
+  const processing = versions.find((v) => v.status === 'processing') || null;
+  return { active, processing, recent: versions };
 }
 
 /**

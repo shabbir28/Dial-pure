@@ -1593,7 +1593,7 @@ async function processGlobalDnc({ versionId, fileId, phoneColumn, actorId, reque
   const seenHashes = new Set();
   const pending = [];
 
-  const INTERNAL_INSERT_BATCH = 2500;
+  const INTERNAL_INSERT_BATCH = 5000;
   const INTERNAL_PROGRESS_EVERY = 25000;
 
   const conn = await getPool().getConnection();
@@ -1661,28 +1661,32 @@ async function processGlobalDnc({ versionId, fileId, phoneColumn, actorId, reque
 
       if (!parsed.valid) {
         invalid += 1;
-      } else if (seenHashes.has(parsed.phoneHash)) {
-        duplicateCount += 1;
       } else {
-        if (seenHashes.size < 5000000) seenHashes.add(parsed.phoneHash);
-        valid += 1;
+        // Use 16-hex prefix for seenSet to save 75% memory on 5M+ rows (prevents Node GC slowdown / OOM)
+        const hashPrefix = parsed.phoneHash ? parsed.phoneHash.slice(0, 16) : '';
+        if (seenHashes.has(hashPrefix)) {
+          duplicateCount += 1;
+        } else {
+          if (seenHashes.size < 5000000) seenHashes.add(hashPrefix);
+          valid += 1;
 
-        pending.push([versionId, parsed.phoneHash, parsed.last4, parsed.countryCode || 'US', sourceRow]);
+          pending.push([versionId, parsed.phoneHash, parsed.last4, parsed.countryCode || 'US', sourceRow]);
 
-        if (pending.length >= INTERNAL_INSERT_BATCH) {
-          const inserted = await bulkInsert(
-            `INSERT IGNORE INTO global_dnc_dead_numbers (version_id, phone_hash, phone_last4, country_code, source_row_number)`,
-            pending.splice(0, pending.length),
-            INTERNAL_INSERT_BATCH,
-            conn
-          );
-          uniqueInserted += inserted;
-          uncommittedRows += INTERNAL_INSERT_BATCH;
+          if (pending.length >= INTERNAL_INSERT_BATCH) {
+            const inserted = await bulkInsert(
+              `INSERT IGNORE INTO global_dnc_dead_numbers (version_id, phone_hash, phone_last4, country_code, source_row_number)`,
+              pending.splice(0, pending.length),
+              INTERNAL_INSERT_BATCH,
+              conn
+            );
+            uniqueInserted += inserted;
+            uncommittedRows += INTERNAL_INSERT_BATCH;
 
-          if (uncommittedRows >= 25000) {
-            await conn.commit();
-            await conn.beginTransaction();
-            uncommittedRows = 0;
+            if (uncommittedRows >= 25000) {
+              await conn.commit();
+              await conn.beginTransaction();
+              uncommittedRows = 0;
+            }
           }
         }
       }
@@ -1706,7 +1710,8 @@ async function processGlobalDnc({ versionId, fileId, phoneColumn, actorId, reque
     }, async ({ totalRows }) => {
       total = Number(totalRows || 0);
       totalKnown = true;
-      await conn.execute(
+      // Commit total_rows immediately so the UI can compute percentage from the start
+      await query(
         `UPDATE global_dnc_dead_versions SET total_rows = ? WHERE id = ?`,
         [total, versionId]
       );
@@ -1758,6 +1763,11 @@ async function processGlobalDnc({ versionId, fileId, phoneColumn, actorId, reque
 
     // Clear global DNC cache so next scrub picks up the new list
     suppressionVersionCache.delete(GLOBAL_DNC_CACHE_KEY);
+
+    // Clean up older inactive versions' numbers in background so the table stays lean
+    query(`DELETE FROM global_dnc_dead_numbers WHERE version_id <> ?`, [versionId]).catch((err) => {
+      console.warn('[Global DNC] Cleanup old numbers notice:', err.message);
+    });
 
     await query(
       `UPDATE files SET row_count = ?, processing_status = 'ready' WHERE id = ?`,

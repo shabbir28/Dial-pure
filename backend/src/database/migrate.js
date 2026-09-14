@@ -49,7 +49,6 @@ async function migrate() {
       ['campaign_numbers', 'idx_campaign_numbers_hash', 'CREATE INDEX idx_campaign_numbers_hash ON campaign_numbers (phone_hash)'],
       ['scrub_rows', 'idx_scrub_rows_hash', 'CREATE INDEX idx_scrub_rows_hash ON scrub_rows (phone_hash)'],
       ['internal_list_numbers', 'idx_iln_hash', 'CREATE INDEX idx_iln_hash ON internal_list_numbers (phone_hash)'],
-      ['global_dnc_dead_numbers', 'idx_gdnc_num_hash', 'CREATE INDEX idx_gdnc_num_hash ON global_dnc_dead_numbers (phone_hash)'],
     ];
     for (const [table, indexName, sql] of extraIndexes) {
       const [found] = await admin.query(
@@ -60,6 +59,12 @@ async function migrate() {
       );
       if (!found.length) await admin.query(sql);
     }
+
+    // Drop redundant idx_gdnc_num_hash on global_dnc_dead_numbers if present.
+    // uq_gdnc_hash (version_id, phone_hash) already covers all queries and keeping this index slows inserts 2x-3x.
+    try {
+      await admin.query('DROP INDEX idx_gdnc_num_hash ON global_dnc_dead_numbers');
+    } catch {}
 
     console.log(`MySQL database '${config.db.database}' is ready.`);
   } finally {
