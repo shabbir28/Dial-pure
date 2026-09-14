@@ -57,14 +57,25 @@ async function seed() {
     console.log('Updated agent: agent@gmail.com / agent123');
   }
 
-  const existingCampaign = await query(`SELECT id FROM campaigns WHERE campaign_code = ?`, ['CMP-MEDICARE']);
+  const existingCampaign = await query(`SELECT id FROM campaigns WHERE campaign_code = ?`, ['CAMP-3']);
   let campaignId = existingCampaign[0]?.id;
   if (!campaignId) {
     campaignId = uuid();
     await query(
       `INSERT INTO campaigns (id, campaign_code, name, description, status, country_code, default_phone_country, created_by)
-       VALUES (?, 'CMP-MEDICARE', 'Medicare Live Transfer', 'US Medicare live-transfer DNC/scrub list', 'active', 'US', 'US', ?)`,
+       VALUES (?, 'CAMP-3', 'Medicare', 'US Medicare live-transfer DNC/scrub list', 'active', 'US', 'US', ?)`,
       [campaignId, adminId]
+    );
+  }
+
+  const existingAca = await query(`SELECT id FROM campaigns WHERE campaign_code = ?`, ['CAMP-1']);
+  let acaId = existingAca[0]?.id;
+  if (!acaId) {
+    acaId = uuid();
+    await query(
+      `INSERT INTO campaigns (id, campaign_code, name, description, status, country_code, default_phone_country, created_by)
+       VALUES (?, 'CAMP-1', 'ACA', 'US ACA health live-transfer DNC/scrub list', 'active', 'US', 'US', ?)`,
+      [acaId, adminId]
     );
   }
 
@@ -77,6 +88,18 @@ async function seed() {
       `INSERT INTO agent_campaign_access (id, campaign_id, agent_id, assigned_by, is_active)
        VALUES (?, ?, ?, ?, 1)`,
       [uuid(), campaignId, agentId, adminId]
+    );
+  }
+
+  const acaAccess = await query(
+    `SELECT id FROM agent_campaign_access WHERE campaign_id = ? AND agent_id = ?`,
+    [acaId, agentId]
+  );
+  if (!acaAccess.length) {
+    await query(
+      `INSERT INTO agent_campaign_access (id, campaign_id, agent_id, assigned_by, is_active)
+       VALUES (?, ?, ?, ?, 1)`,
+      [uuid(), acaId, agentId, adminId]
     );
   }
 
