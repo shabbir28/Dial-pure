@@ -1,0 +1,4 @@
+ERR Error: Unknown column 'f.size_bytes' in 'field list'
+    at query (D:\dial pure\backend\src\config\database.js:28:34)
+    at D:\dial pure\backend\_diag.js:65:26
+    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)

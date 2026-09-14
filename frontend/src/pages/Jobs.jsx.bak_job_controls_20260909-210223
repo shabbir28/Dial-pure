@@ -1,0 +1,67 @@
+import { useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
+import { Eye } from 'lucide-react';
+import api from '../services/api';
+import { duration, formatDate, formatNumber } from '../utils/format';
+import StatusBadge from '../components/StatusBadge';
+import Button from '../components/Button';
+
+export default function Jobs() {
+  const [items, setItems] = useState([]);
+  const [filters, setFilters] = useState({ jobId: '', status: '', filename: '' });
+
+  async function load() {
+    const res = await api.get('/scrub-jobs', { params: { ...filters, pageSize: 50 } });
+    setItems(res.data.items);
+  }
+  useEffect(() => { load(); }, []);
+
+  return (
+    <div>
+      <h2 className="page-title">Scrub jobs</h2>
+      <p className="page-sub">Every upload is a pinned, auditable job against one campaign version.</p>
+      <div className="filters">
+        <input className="input" placeholder="Job ID" value={filters.jobId} onChange={(e) => setFilters({ ...filters, jobId: e.target.value })} />
+        <input className="input" placeholder="Filename" value={filters.filename} onChange={(e) => setFilters({ ...filters, filename: e.target.value })} />
+        <select className="input" value={filters.status} onChange={(e) => setFilters({ ...filters, status: e.target.value })}>
+          <option value="">All statuses</option>
+          {['queued','validating','processing','generating_exports','completed','failed','cancelled'].map((s) => <option key={s}>{s}</option>)}
+        </select>
+        <Button type="button" variant="secondary" onClick={load}>Filter</Button>
+      </div>
+      <div className="card table-wrap">
+        <table className="data-table">
+          <thead>
+            <tr>
+              <th>Job</th><th>Agent</th><th>Campaign</th><th>File</th><th>Uploaded</th>
+              <th>Total</th><th>Clean</th><th>Match</th><th>Invalid</th><th>Dup</th><th>Status</th><th>Time</th><th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((j) => (
+              <tr key={j.id}>
+                <td><Link to={`/jobs/${j.id}`}>{j.job_number}</Link></td>
+                <td>{j.first_name} {j.last_name}</td>
+                <td>{j.campaign_name} v{j.version_number}</td>
+                <td>{j.original_filename}</td>
+                <td>{formatDate(j.created_at)}</td>
+                <td>{formatNumber(j.total_rows)}</td>
+                <td>{formatNumber(j.clean_count)}</td>
+                <td>{formatNumber(j.matched_count)}</td>
+                <td>{formatNumber(j.invalid_count)}</td>
+                <td>{formatNumber(j.duplicate_count)}</td>
+                <td><StatusBadge value={j.status} /></td>
+                <td>{duration(j.started_at, j.completed_at)}</td>
+                <td>
+                  <Link className="icon-btn" to={`/jobs/${j.id}`} title="View">
+                    <Eye size={14} />
+                  </Link>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}

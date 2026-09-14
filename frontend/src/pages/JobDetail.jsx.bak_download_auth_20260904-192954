@@ -1,0 +1,216 @@
+import { useEffect, useRef, useState } from 'react';
+import { Link, useParams } from 'react-router-dom';
+import api from '../services/api';
+import { subscribeJob } from '../services/socket';
+import { formatDate } from '../utils/format';
+import StatusBadge from '../components/StatusBadge';
+import { useAuth } from '../context/AuthContext';
+import Button from '../components/Button';
+import JobStatusCard from '../components/JobStatusCard';
+import TablePager from '../components/TablePager';
+import { useToast } from '../components/Toast';
+
+export default function JobDetail() {
+  const { id } = useParams();
+  const { user } = useAuth();
+  const toast = useToast();
+  const [job, setJob] = useState(null);
+  const [audit, setAudit] = useState([]);
+  const [rows, setRows] = useState({ items: [], pagination: {} });
+  const [rowPhone, setRowPhone] = useState('');
+  const [rowStatus, setRowStatus] = useState('');
+  const [rowPage, setRowPage] = useState(1);
+  const [rowPageSize, setRowPageSize] = useState(10);
+  const prevStatusRef = useRef(null);
+  const rowQueryRef = useRef({ phone: '', status: '', page: 1, pageSize: 10 });
+
+  async function load() {
+    const res = await api.get(`/scrub-jobs/${id}`);
+    setJob(res.data);
+    return res.data;
+  }
+
+  async function loadRows(phone = rowPhone, status = rowStatus, page = rowPage, pageSize = rowPageSize) {
+    const res = await api.get(`/scrub-jobs/${id}/rows`, {
+      params: { phone: phone || undefined, status: status || undefined, page, pageSize },
+    });
+    setRows(res.data);
+  }
+
+  useEffect(() => {
+    rowQueryRef.current = { phone: rowPhone, status: rowStatus, page: rowPage, pageSize: rowPageSize };
+  }, [rowPhone, rowStatus, rowPage, rowPageSize]);
+
+  useEffect(() => {
+    let timer;
+    let stopped = false;
+    prevStatusRef.current = null;
+
+    async function tick() {
+      try {
+        const next = await load();
+        if (stopped || !next) return;
+        if (['completed', 'failed', 'cancelled'].includes(next.status)) {
+          clearInterval(timer);
+        }
+      } catch {
+        // keep polling until the job page unmounts
+      }
+    }
+
+    tick();
+    timer = setInterval(tick, 2500);
+    const unsub = subscribeJob(id, tick);
+    if (user?.role === 'admin') {
+      api.get('/audit-logs', { params: { jobId: id, pageSize: 30 } }).then((r) => setAudit(r.data.items));
+    }
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+      unsub();
+    };
+  }, [id]);
+
+  useEffect(() => {
+    loadRows(rowPhone, rowStatus, rowPage, rowPageSize);
+  }, [id, rowPage, rowPageSize]);
+
+  useEffect(() => {
+    if (!job) return;
+    const wasRunning = prevStatusRef.current && prevStatusRef.current !== 'completed';
+    if (job.status === 'completed' && wasRunning) {
+      const q = rowQueryRef.current;
+      loadRows(q.phone, q.status, q.page, q.pageSize);
+    }
+    prevStatusRef.current = job.status;
+  }, [job?.status]);
+
+  async function download(exportId) {
+    const token = localStorage.getItem('accessToken');
+    try {
+      const res = await fetch(`/api/exports/${exportId}/download`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) {
+        toast.push('Download failed');
+        return;
+      }
+      const blob = await res.blob();
+      const header = res.headers.get('Content-Disposition') || '';
+      const match = header.match(/filename="?([^"]+)"?/i);
+      const name = match?.[1] || 'download.csv';
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = name;
+      a.click();
+      URL.revokeObjectURL(url);
+      await load();
+    } catch (error) {
+      toast.push(error.message || 'Download failed');
+    }
+  }
+
+  if (!job) return <p>Loading job...</p>;
+
+  return (
+    <div>
+      <h2 className="page-title">{job.job_number}</h2>
+      {(job.priorSameFile || []).length > 0 && (
+        <div className="notice">
+          <strong>This file was already scrubbed</strong>
+          <p>
+            The same file was uploaded against this campaign version as{' '}
+            {(job.priorSameFile || []).map((prior, i) => (
+              <span key={prior.id}>
+                {i > 0 ? ', ' : ''}
+                <Link to={`/jobs/${prior.id}`}>{prior.job_number}</Link>
+              </span>
+            ))}
+            . Results match unless the campaign list changed.
+          </p>
+        </div>
+      )}
+      <div className="job-meta-bar">
+        <div className="job-pill"><span>Campaign</span><strong>{job.campaign_name}</strong></div>
+        <div className="job-pill"><span>Version</span><strong>v{job.version_number}</strong></div>
+        <div className="job-pill"><span>Uploaded by</span><strong>{job.first_name} {job.last_name}</strong></div>
+        <div className="job-pill"><span>Phone column</span><strong>{job.phone_column_name || '—'}</strong></div>
+      </div>
+      <div style={{ marginBottom: 16 }}>
+        <JobStatusCard
+          job={job}
+          onDownload={download}
+          isAdmin={user?.role === 'admin'}
+        />
+      </div>
+      <div className="card" style={{ marginTop: 16 }}>
+        <h3>Numbers in this file</h3>
+        <p className="page-sub">Uploaded by {job.first_name} {job.last_name}. Search a full number or last 4 digits.</p>
+        <div className="filters">
+          <input className="input" placeholder="Phone or last 4" value={rowPhone} onChange={(e) => setRowPhone(e.target.value)} />
+          <select className="input" value={rowStatus} onChange={(e) => setRowStatus(e.target.value)}>
+            <option value="">All statuses</option>
+            <option value="clean">clean</option>
+            <option value="match">match</option>
+            <option value="external_match">client match</option>
+            <option value="invalid">invalid</option>
+            <option value="duplicate">duplicate</option>
+          </select>
+          <Button type="button" onClick={() => {
+            setRowPage(1);
+            loadRows(rowPhone, rowStatus, 1, rowPageSize);
+          }}>Search</Button>
+        </div>
+        <div className="table-wrap">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Phone</th>
+                <th>Reason</th>
+                <th>IP</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(rows.items || []).length === 0 ? (
+                <tr><td colSpan={5} style={{ color: 'var(--color-muted)' }}>No rows match this filter.</td></tr>
+              ) : rows.items.map((row) => (
+                <tr key={row.sourceRow}>
+                  <td>{row.sourceRow}</td>
+                  <td>{row.phone?.national}</td>
+                  <td>{row.status === 'external_match'
+                    ? 'Client match'
+                    : row.invalidReason === 'already_present'
+                      ? 'Already in database'
+                      : row.matchedCampaignName
+                        ? `On ${row.matchedCampaignName}`
+                        : (row.invalidReason || (row.duplicateOfRow ? `dup of ${row.duplicateOfRow}` : '—'))}</td>
+                  <td>{row.uploadedIp || job.created_ip || '—'}</td>
+                  <td><StatusBadge value={row.status} /></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <TablePager
+          pagination={rows.pagination}
+          pageSize={rowPageSize}
+          onPage={setRowPage}
+          onPageSize={(size) => { setRowPageSize(size); setRowPage(1); }}
+        />
+      </div>
+      {user?.role === 'admin' && (
+        <div className="card" style={{ marginTop: 16 }}>
+          <h3>Related audit events</h3>
+          {audit.map((a) => (
+            <div key={a.id} style={{ padding: '8px 0', borderBottom: '1px solid var(--outline)', fontSize: 13 }}>
+              <strong>{a.action}</strong> · {formatDate(a.created_at)} · {a.ip_address || ''}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}

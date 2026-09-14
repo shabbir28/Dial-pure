@@ -1,0 +1,317 @@
+'use strict';
+
+const { query, withTransaction } = require('../config/database');
+const { uuid, nextSequentialCode } = require('../utils/ids');
+const { AppError } = require('../utils/response');
+const audit = require('./auditService');
+const { sqlLimit } = require('../utils/pagination');
+
+async function nextCampaignCode() {
+  const rows = await query(`SELECT campaign_code FROM campaigns`);
+  return nextSequentialCode(rows.map((row) => row.campaign_code), 'CAMP');
+}
+
+async function createCampaign({ actor, payload, ip, userAgent, requestId }) {
+  const name = String(payload.name || '').trim();
+  if (!name) {
+    throw new AppError('NAME_REQUIRED', 'Enter a campaign name.', 400);
+  }
+  const allowedStatus = new Set(['active', 'inactive', 'archived']);
+  const status = allowedStatus.has(payload.status) ? payload.status : 'active';
+  const id = uuid();
+  let code = await nextCampaignCode();
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    try {
+      await query(
+        `INSERT INTO campaigns (id, campaign_code, name, description, status, country_code, default_phone_country, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          id,
+          code,
+          name,
+          payload.description || null,
+          status,
+          payload.countryCode || 'US',
+          payload.defaultPhoneCountry || 'US',
+          actor.id,
+        ]
+      );
+      break;
+    } catch (error) {
+      if (error.code !== 'ER_DUP_ENTRY' || attempt === 7) throw error;
+      code = await nextCampaignCode();
+    }
+  }
+  await query(
+    `INSERT INTO campaign_versions (
+       id, campaign_id, version_number, status, created_by, activated_by, activated_at
+     ) VALUES (?, ?, 1, 'active', ?, ?, NOW())`,
+    [uuid(), id, actor.id, actor.id]
+  );
+  await audit.write({
+    requestId,
+    actorUserId: actor.id,
+    actorRole: actor.role,
+    action: 'CAMPAIGN_CREATED',
+    entityType: 'campaign',
+    entityId: id,
+    description: `Created campaign ${name}`,
+    newValues: { name, campaignCode: code },
+    ipAddress: ip,
+    userAgent,
+  });
+  return getCampaign(id, actor);
+}
+
+async function listCampaigns({ actor, status, search, pagination, hasActiveVersion }) {
+  const where = [];
+  const params = [];
+  if (actor.role === 'agent') {
+    where.push(`c.status = 'active'`);
+  } else if (status) {
+    where.push('c.status = ?');
+    params.push(status);
+  }
+  if (search) {
+    where.push('(c.name LIKE ? OR c.campaign_code LIKE ?)');
+    params.push(`%${search}%`, `%${search}%`);
+  }
+  if (hasActiveVersion) {
+    where.push(`EXISTS (
+      SELECT 1 FROM campaign_versions cv
+      WHERE cv.campaign_id = c.id AND cv.status = 'active' AND cv.unique_numbers > 0
+    )`);
+  }
+  const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const count = await query(`SELECT COUNT(*) AS total FROM campaigns c ${clause}`, params);
+  const items = await query(
+    `SELECT c.*,
+      (SELECT cv.version_number FROM campaign_versions cv WHERE cv.campaign_id = c.id AND cv.status = 'active' LIMIT 1) AS active_version,
+      (SELECT cv.id FROM campaign_versions cv WHERE cv.campaign_id = c.id AND cv.status = 'active' LIMIT 1) AS active_version_id,
+      (SELECT cv.unique_numbers FROM campaign_versions cv WHERE cv.campaign_id = c.id AND cv.status = 'active' LIMIT 1) AS active_unique_numbers
+     FROM campaigns c
+     ${clause}
+     ORDER BY c.created_at DESC
+     ${sqlLimit(pagination)}`,
+    params
+  );
+  return { items, total: count[0].total };
+}
+
+async function getCampaign(id, actor) {
+  const rows = await query(`SELECT * FROM campaigns WHERE id = ?`, [id]);
+  if (!rows.length) throw new AppError('CAMPAIGN_NOT_FOUND', 'Campaign not found.', 404);
+  const campaign = rows[0];
+  if (actor.role === 'agent') {
+    const access = await query(
+      `SELECT id FROM agent_campaign_access WHERE campaign_id = ? AND agent_id = ? AND is_active = 1`,
+      [id, actor.id]
+    );
+    if (!access.length || campaign.status !== 'active') {
+      throw new AppError('FORBIDDEN', 'You do not have access to this campaign.', 403);
+    }
+  }
+  const versions = await query(
+    `SELECT cv.*, f.original_filename
+     FROM campaign_versions cv
+     LEFT JOIN files f ON f.id = cv.source_file_id
+     WHERE cv.campaign_id = ?
+     ORDER BY cv.version_number DESC`,
+    [id]
+  );
+  const agents = actor.role === 'admin'
+    ? await query(
+        `SELECT a.id, a.agent_id, a.is_active, a.assigned_at, a.revoked_at,
+                u.first_name, u.last_name, u.email
+         FROM agent_campaign_access a
+         JOIN users u ON u.id = a.agent_id
+         WHERE a.campaign_id = ?
+         ORDER BY a.assigned_at DESC`,
+        [id]
+      )
+    : [];
+  return { ...campaign, versions, agents };
+}
+
+async function updateCampaign({ actor, id, payload, ip, userAgent, requestId }) {
+  const current = await getCampaign(id, actor);
+  const fields = [];
+  const params = [];
+  const oldValues = {};
+  const newValues = {};
+  for (const [key, column] of [
+    ['name', 'name'],
+    ['description', 'description'],
+    ['status', 'status'],
+    ['countryCode', 'country_code'],
+    ['defaultPhoneCountry', 'default_phone_country'],
+  ]) {
+    if (payload[key] !== undefined) {
+      oldValues[column] = current[column];
+      newValues[column] = payload[key];
+      fields.push(`${column} = ?`);
+      params.push(payload[key]);
+    }
+  }
+  if (payload.status === 'archived') {
+    fields.push('archived_at = NOW()');
+  }
+  if (!fields.length) return current;
+  params.push(id);
+  await query(`UPDATE campaigns SET ${fields.join(', ')} WHERE id = ?`, params);
+  await audit.write({
+    requestId,
+    actorUserId: actor.id,
+    actorRole: actor.role,
+    action: payload.status === 'archived' ? 'CAMPAIGN_ARCHIVED' : 'CAMPAIGN_UPDATED',
+    entityType: 'campaign',
+    entityId: id,
+    oldValues,
+    newValues,
+    ipAddress: ip,
+    userAgent,
+  });
+  return getCampaign(id, actor);
+}
+
+async function assignAgent({ actor, campaignId, agentId, ip, userAgent, requestId }) {
+  const campaign = await getCampaign(campaignId, actor);
+  const agent = await query(`SELECT * FROM users WHERE id = ? AND role = 'agent'`, [agentId]);
+  if (!agent.length) throw new AppError('USER_NOT_FOUND', 'Agent not found.', 404);
+
+  const existing = await query(
+    `SELECT * FROM agent_campaign_access WHERE campaign_id = ? AND agent_id = ?`,
+    [campaignId, agentId]
+  );
+  if (existing.length) {
+    await query(
+      `UPDATE agent_campaign_access SET is_active = 1, revoked_at = NULL, assigned_by = ?, assigned_at = NOW()
+       WHERE campaign_id = ? AND agent_id = ?`,
+      [actor.id, campaignId, agentId]
+    );
+  } else {
+    await query(
+      `INSERT INTO agent_campaign_access (id, campaign_id, agent_id, assigned_by, is_active)
+       VALUES (?, ?, ?, ?, 1)`,
+      [uuid(), campaignId, agentId, actor.id]
+    );
+  }
+  await audit.write({
+    requestId,
+    actorUserId: actor.id,
+    actorRole: actor.role,
+    action: 'AGENT_ASSIGNED_TO_CAMPAIGN',
+    entityType: 'campaign',
+    entityId: campaignId,
+    description: `Assigned ${agent[0].email} to ${campaign.name}`,
+    metadata: { agentId },
+    ipAddress: ip,
+    userAgent,
+  });
+  return getCampaign(campaignId, actor);
+}
+
+async function revokeAgent({ actor, campaignId, agentId, ip, userAgent, requestId }) {
+  await query(
+    `UPDATE agent_campaign_access SET is_active = 0, revoked_at = NOW()
+     WHERE campaign_id = ? AND agent_id = ?`,
+    [campaignId, agentId]
+  );
+  await audit.write({
+    requestId,
+    actorUserId: actor.id,
+    actorRole: actor.role,
+    action: 'AGENT_REMOVED_FROM_CAMPAIGN',
+    entityType: 'campaign',
+    entityId: campaignId,
+    metadata: { agentId },
+    ipAddress: ip,
+    userAgent,
+  });
+  return getCampaign(campaignId, actor);
+}
+
+async function assertAgentAccess(agentId, campaignId) {
+  const rows = await query(
+    `SELECT a.id FROM agent_campaign_access a
+     JOIN campaigns c ON c.id = a.campaign_id
+     WHERE a.agent_id = ? AND a.campaign_id = ? AND a.is_active = 1 AND c.status = 'active'`,
+    [agentId, campaignId]
+  );
+  if (!rows.length) {
+    throw new AppError('FORBIDDEN', 'You do not have access to this campaign.', 403);
+  }
+}
+
+async function getActiveVersion(campaignId) {
+  const rows = await query(
+    `SELECT * FROM campaign_versions WHERE campaign_id = ? AND status = 'active' LIMIT 1`,
+    [campaignId]
+  );
+  if (rows.length) return rows[0];
+  const latest = await query(
+    `SELECT * FROM campaign_versions WHERE campaign_id = ? ORDER BY version_number DESC LIMIT 1`,
+    [campaignId]
+  );
+  if (latest.length) return latest[0];
+  const versionId = uuid();
+  await query(
+    `INSERT INTO campaign_versions (
+       id, campaign_id, version_number, status, created_by, activated_by, activated_at
+     ) VALUES (?, ?, 1, 'active', NULL, NULL, NOW())`,
+    [versionId, campaignId]
+  );
+  const created = await query(`SELECT * FROM campaign_versions WHERE id = ?`, [versionId]);
+  return created[0];
+}
+
+async function activateVersion({ actor, campaignId, versionId, ip, userAgent, requestId }) {
+  return withTransaction(async (conn) => {
+    const [versions] = await conn.execute(
+      `SELECT * FROM campaign_versions WHERE id = ? AND campaign_id = ?`,
+      [versionId, campaignId]
+    );
+    if (!versions.length) throw new AppError('VERSION_NOT_FOUND', 'Campaign version not found.', 404);
+    const version = versions[0];
+    if (!['ready', 'inactive', 'active'].includes(version.status)) {
+      throw new AppError('VERSION_NOT_READY', 'Only ready or inactive versions can be activated.', 400);
+    }
+    await conn.execute(
+      `UPDATE campaign_versions
+       SET status = 'inactive', deactivated_at = NOW()
+       WHERE campaign_id = ? AND status = 'active' AND id <> ?`,
+      [campaignId, versionId]
+    );
+    await conn.execute(
+      `UPDATE campaign_versions
+       SET status = 'active', activated_by = ?, activated_at = NOW(), deactivated_at = NULL
+       WHERE id = ?`,
+      [actor.id, versionId]
+    );
+    await audit.write({
+      requestId,
+      actorUserId: actor.id,
+      actorRole: actor.role,
+      action: 'CAMPAIGN_VERSION_ACTIVATED',
+      entityType: 'campaign_version',
+      entityId: versionId,
+      description: `Activated version ${version.version_number}`,
+      metadata: { campaignId, versionNumber: version.version_number },
+      ipAddress: ip,
+      userAgent,
+    });
+    return version;
+  });
+}
+
+module.exports = {
+  createCampaign,
+  listCampaigns,
+  getCampaign,
+  updateCampaign,
+  assignAgent,
+  revokeAgent,
+  assertAgentAccess,
+  getActiveVersion,
+  activateVersion,
+};

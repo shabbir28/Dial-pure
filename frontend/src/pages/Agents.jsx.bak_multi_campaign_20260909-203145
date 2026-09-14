@@ -1,0 +1,272 @@
+import { useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
+import { Plus } from 'lucide-react';
+import api from '../services/api';
+import Modal from '../components/Modal';
+import Button from '../components/Button';
+import RowActions from '../components/RowActions';
+import ConfirmDialog from '../components/ConfirmDialog';
+import { useToast } from '../components/Toast';
+import { formatDate } from '../utils/format';
+import StatusBadge from '../components/StatusBadge';
+
+function previewUserCode(items, role) {
+  const prefix = role === 'admin' ? 'ADM' : 'AGT';
+  let max = 0;
+  for (const item of items || []) {
+    const match = String(item.user_code || '').match(new RegExp(`^${prefix}-(\\d+)$`, 'i'));
+    if (match) max = Math.max(max, Number(match[1]));
+  }
+  return `${prefix}-${max + 1}`;
+}
+
+const empty = {
+  firstName: '',
+  lastName: '',
+  username: '',
+  password: '',
+  role: 'agent',
+  campaignId: ''
+};
+
+export default function Agents() {
+  const toast = useToast();
+  const [items, setItems] = useState([]);
+  const [campaigns, setCampaigns] = useState([]);
+  const [open, setOpen] = useState(false);
+  const [editing, setEditing] = useState(null);
+  const [form, setForm] = useState(empty);
+  const [pendingDisable, setPendingDisable] = useState(null);
+
+  async function load() {
+    const [usersRes, campaignsRes] = await Promise.all([
+      api.get('/users', { params: { pageSize: 100 } }),
+      api.get('/campaigns', { params: { pageSize: 100 } })
+    ]);
+
+    setItems(usersRes.data.items);
+    setCampaigns(
+      (campaignsRes.data.items || []).filter(
+        (c) => c.status !== 'archived'
+      )
+    );
+  }
+  useEffect(() => { load(); }, []);
+
+  function startCreate() {
+    setEditing(null);
+    setForm(empty);
+    setOpen(true);
+  }
+
+  function startEdit(row) {
+    setEditing(row);
+    setForm({
+      firstName: row.first_name || '',
+      lastName: row.last_name || '',
+      username: row.username || '',
+      password: '',
+      role: row.role,
+      campaignId: ''
+    });
+    setOpen(true);
+  }
+
+  async function save(e) {
+    e.preventDefault();
+    try {
+      if (editing) {
+        const payload = {
+          firstName: form.firstName,
+          lastName: form.lastName,
+          username: form.username,
+          role: form.role
+        };
+        if (form.password) payload.password = form.password;
+        await api.patch(`/users/${editing.id}`, payload);
+        toast.push('User updated');
+      } else {
+        if (!form.campaignId) {
+          toast.push('Select campaign access.');
+          return;
+        }
+
+        const {
+          campaignId,
+          ...userPayload
+        } = form;
+
+        const created = await api.post('/users', userPayload);
+
+        await api.post(
+          `/campaigns/${campaignId}/agents`,
+          { agentId: created.data.id }
+        );
+
+        toast.push('User created with campaign access');
+      }
+      setOpen(false);
+      load();
+    } catch (error) {
+      toast.push(error.message);
+    }
+  }
+
+  async function disableUser(row) {
+    try {
+      await api.patch(`/users/${row.id}`, { status: 'inactive' });
+      toast.push('User disabled');
+      setPendingDisable(null);
+      load();
+    } catch (error) {
+      toast.push(error.message);
+    }
+  }
+
+  return (
+    <div>
+      <div className="page-header">
+        <div>
+          <h2 className="page-title">Agents & users</h2>
+          <p className="page-sub">Accounts are never hard-deleted. Disable them instead.</p>
+        </div>
+        <Button onClick={startCreate}><Plus size={16} /> Create user</Button>
+      </div>
+      <div className="card table-wrap">
+        <table className="data-table">
+          <thead>
+            <tr>
+              <th>Code</th><th>Name</th><th>Username</th><th>Role</th>
+              <th>Status</th><th>Last login</th><th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((u) => (
+              <tr key={u.id}>
+                <td>{u.user_code}</td>
+                <td>{u.first_name} {u.last_name}</td>
+                <td><strong>{u.username}</strong></td>
+                <td><span className={`badge ${u.role}`}>{u.role}</span></td>
+                <td><StatusBadge value={u.status} /></td>
+                <td>{formatDate(u.last_login_at)}</td>
+                <td>
+                  <div className="row-actions">
+                    {u.role === 'agent' && (
+                      <Link className="btn btn--secondary btn--sm" to={`/lookup?agentId=${u.id}`}>Numbers</Link>
+                    )}
+                    <RowActions
+                      onEdit={() => startEdit(u)}
+                      onDelete={u.status === 'active' ? () => setPendingDisable(u) : null}
+                      deleteTitle="Disable"
+                    />
+                    {u.status !== 'active' && (
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        size="sm"
+                        onClick={() => api.patch(`/users/${u.id}`, { status: 'active' }).then(load)}
+                      >
+                        Enable
+                      </Button>
+                    )}
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {open && (
+        <Modal title={editing ? 'Edit user' : 'Create user'} onClose={() => setOpen(false)}>
+          <form onSubmit={save}>
+            <div className="field">
+              <label>Code</label>
+              <input
+                className="input input--locked"
+                value={editing ? editing.user_code : previewUserCode(items, form.role)}
+                readOnly
+                tabIndex={-1}
+              />
+            </div>
+            <div className="field"><label>First name</label><input className="input" value={form.firstName} onChange={(e) => setForm({ ...form, firstName: e.target.value })} required /></div>
+            <div className="field"><label>Last name</label><input className="input" value={form.lastName} onChange={(e) => setForm({ ...form, lastName: e.target.value })} required /></div>
+            <div className="field">
+              <label>Username</label>
+              <input
+                className="input"
+                type="text"
+                value={form.username}
+                onChange={(e) =>
+                  setForm({
+                    ...form,
+                    username: e.target.value
+                      .toLowerCase()
+                      .replace(/[^a-z0-9._-]/g, '')
+                  })
+                }
+                placeholder="e.g. wave"
+                minLength={2}
+                maxLength={32}
+                required
+                autoComplete="username"
+              />
+            </div>
+            <div className="field">
+              <label>{editing ? 'New password (optional)' : 'Password'}</label>
+              <input className="input" type="password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} required={!editing} />
+            </div>
+            <div className="field">
+              <label>Role</label>
+              <select className="input" value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value })}>
+                <option value="agent">Agent</option>
+                <option value="admin">Admin</option>
+              </select>
+            </div>
+
+            {!editing && (
+              <div className="field">
+                <label>Campaign Access</label>
+                <select
+                  className="input"
+                  value={form.campaignId}
+                  onChange={(e) =>
+                    setForm({
+                      ...form,
+                      campaignId: e.target.value
+                    })
+                  }
+                  required
+                >
+                  <option value="">Select campaign</option>
+
+                  {campaigns.map((campaign) => (
+                    <option
+                      key={campaign.id}
+                      value={campaign.id}
+                    >
+                      {campaign.campaign_code} · {campaign.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+            <div className="modal-actions">
+              <Button type="button" variant="secondary" onClick={() => setOpen(false)}>Cancel</Button>
+              <Button type="submit">Save</Button>
+            </div>
+          </form>
+        </Modal>
+      )}
+      {pendingDisable && (
+        <ConfirmDialog
+          title="Disable user"
+          body={`${pendingDisable.username} will be disabled. The account is kept for history.`}
+          confirmLabel="Disable"
+          danger
+          onClose={() => setPendingDisable(null)}
+          onConfirm={() => disableUser(pendingDisable)}
+        />
+      )}
+    </div>
+  );
+}

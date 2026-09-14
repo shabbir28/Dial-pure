@@ -1,0 +1,189 @@
+'use strict';
+
+const campaignService = require('../services/campaignService');
+const scrubJobService = require('../services/scrubJobService');
+const { previewFile } = require('../services/fileParseService');
+const storage = require('../services/storageService');
+const { query } = require('../config/database');
+const { success, AppError } = require('../utils/response');
+const { parsePagination, paginated, sqlLimit } = require('../utils/pagination');
+
+function ctx(req) {
+  return {
+    actor: req.user,
+    ip: (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim(),
+    userAgent: req.headers['user-agent'],
+    requestId: req.requestId,
+  };
+}
+
+async function list(req, res, next) {
+  try {
+    const pagination = parsePagination(req.query);
+    const result = await campaignService.listCampaigns({
+      actor: req.user,
+      status: req.query.status,
+      search: req.query.search,
+      hasActiveVersion: req.query.hasActiveVersion === '1' || req.query.hasActiveVersion === 'true',
+      pagination,
+    });
+    success(res, paginated(result.items, result.total, pagination));
+  } catch (error) {
+    next(error);
+  }
+}
+
+async function create(req, res, next) {
+  try {
+    const campaign = await campaignService.createCampaign({
+      ...ctx(req),
+      payload: req.body,
+    });
+    success(res, campaign, 201);
+  } catch (error) {
+    next(error);
+  }
+}
+
+async function get(req, res, next) {
+  try {
+    const campaign = await campaignService.getCampaign(req.params.id, req.user);
+    success(res, campaign);
+  } catch (error) {
+    next(error);
+  }
+}
+
+async function update(req, res, next) {
+  try {
+    const campaign = await campaignService.updateCampaign({
+      ...ctx(req),
+      id: req.params.id,
+      payload: req.body,
+    });
+    success(res, campaign);
+  } catch (error) {
+    next(error);
+  }
+}
+
+async function assignAgent(req, res, next) {
+  try {
+    const campaign = await campaignService.assignAgent({
+      ...ctx(req),
+      campaignId: req.params.id,
+      agentId: req.body.agentId,
+    });
+    success(res, campaign);
+  } catch (error) {
+    next(error);
+  }
+}
+
+async function revokeAgent(req, res, next) {
+  try {
+    const campaign = await campaignService.revokeAgent({
+      ...ctx(req),
+      campaignId: req.params.id,
+      agentId: req.params.agentId,
+    });
+    success(res, campaign);
+  } catch (error) {
+    next(error);
+  }
+}
+
+async function versions(req, res, next) {
+  try {
+    const campaign = await campaignService.getCampaign(req.params.id, req.user);
+    success(res, campaign.versions);
+  } catch (error) {
+    next(error);
+  }
+}
+
+async function uploadMaster(req, res, next) {
+  try {
+    const result = await scrubJobService.createMasterUpload({
+      actor: req.user,
+      campaignId: req.params.id,
+      file: req.file,
+      phoneColumn: req.body.phoneColumn,
+      req,
+    });
+    success(res, result, 201);
+  } catch (error) {
+    next(error);
+  } finally {
+    await storage.removePath(req.file?.path);
+  }
+}
+
+async function activateVersion(req, res, next) {
+  try {
+    const version = await campaignService.activateVersion({
+      ...ctx(req),
+      campaignId: req.params.id,
+      versionId: req.params.versionId,
+    });
+    success(res, version);
+  } catch (error) {
+    next(error);
+  }
+}
+
+async function preview(req, res, next) {
+  try {
+    if (!req.file) throw new AppError('FILE_REQUIRED', 'A file is required.', 400);
+    const ext = require('../utils/fileDetect').detectExtension(req.file.originalname);
+    const previewData = await previewFile(req.file.path, ext);
+    success(res, {
+      ...previewData,
+      originalFilename: req.file.originalname,
+      size: req.file.size,
+    });
+  } catch (error) {
+    next(error);
+  } finally {
+    await storage.removePath(req.file?.path);
+  }
+}
+
+async function listFiles(req, res, next) {
+  try {
+    const pagination = parsePagination(req.query);
+    const where = ['deleted_at IS NULL'];
+    const params = [];
+    if (req.query.fileType) {
+      where.push('file_type = ?');
+      params.push(req.query.fileType);
+    }
+    const clause = `WHERE ${where.join(' AND ')}`;
+    const count = await query(`SELECT COUNT(*) AS total FROM files ${clause}`, params);
+    const items = await query(
+      `SELECT id, file_uuid, original_filename, file_type, mime_type, extension, file_size_bytes,
+              checksum_sha256, uploaded_by, uploaded_ip, row_count, processing_status, created_at
+       FROM files ${clause}
+       ORDER BY created_at DESC
+       ${sqlLimit(pagination)}`,
+      params
+    );
+    success(res, paginated(items, count[0].total, pagination));
+  } catch (error) {
+    next(error);
+  }
+}
+
+module.exports = {
+  list,
+  create,
+  get,
+  update,
+  assignAgent,
+  revokeAgent,
+  versions,
+  uploadMaster,
+  activateVersion,
+  preview,
+  listFiles,
+};

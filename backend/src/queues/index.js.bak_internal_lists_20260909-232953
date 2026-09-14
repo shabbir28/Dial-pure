@@ -1,0 +1,97 @@
+'use strict';
+
+const { query } = require('../config/database');
+
+const processors = {
+  'scrub-job': (data) => require('../workers/processors').processScrubJob(data),
+  'campaign-master': (data) => require('../workers/processors').processCampaignMaster(data),
+};
+
+const memoryQueue = [];
+const queuedKeys = new Set();
+let draining = false;
+
+function queueKey(name, data = {}) {
+  if (name === 'scrub-job' && data.jobId) {
+    return `${name}:${data.jobId}:${data.restart ? 'restart' : 'normal'}`;
+  }
+  return null;
+}
+
+async function drainMemory() {
+  if (draining) return;
+  draining = true;
+  while (memoryQueue.length) {
+    const item = memoryQueue.shift();
+
+    try {
+      await processors[item.name](item.data);
+    } catch (error) {
+      console.error(`Job ${item.name} failed:`, error);
+    } finally {
+      if (item.key) queuedKeys.delete(item.key);
+    }
+  }
+  draining = false;
+}
+
+async function enqueue(name, data) {
+  if (!processors[name]) {
+    throw new Error(`Unknown queue job: ${name}`);
+  }
+
+  const key = queueKey(name, data);
+
+  if (key && queuedKeys.has(key)) {
+    return false;
+  }
+
+  if (key) queuedKeys.add(key);
+
+  memoryQueue.push({ name, data, key });
+  setImmediate(drainMemory);
+  return true;
+}
+
+async function initQueues() {
+  console.log('Background job queue ready (in-process).');
+
+  try {
+    const unfinished = await query(
+      `SELECT id, job_number, status
+       FROM scrub_jobs
+       WHERE status IN (
+         'queued',
+         'validating',
+         'processing',
+         'generating_exports'
+       )
+       ORDER BY created_at ASC`
+    );
+
+    if (unfinished.length) {
+      console.log(
+        `[Queue Recovery] Found ${unfinished.length} unfinished scrub job(s).`
+      );
+    }
+
+    for (const job of unfinished) {
+      console.log(
+        `[Queue Recovery] Re-queueing ${job.job_number} from status ${job.status}`
+      );
+
+      await enqueue('scrub-job', {
+        jobId: job.id,
+        requestId: job.id,
+        restart: true,
+      });
+    }
+  } catch (error) {
+    console.error(
+      '[Queue Recovery] Could not recover unfinished jobs:',
+      error
+    );
+  }
+}
+
+module.exports = { enqueue, initQueues };

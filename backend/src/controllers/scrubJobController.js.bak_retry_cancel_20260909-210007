@@ -1,0 +1,92 @@
+'use strict';
+
+const scrubJobService = require('../services/scrubJobService');
+const storage = require('../services/storageService');
+const { success } = require('../utils/response');
+const { parsePagination, paginated } = require('../utils/pagination');
+
+async function create(req, res, next) {
+  try {
+    const job = await scrubJobService.createScrubJob({
+      actor: req.user,
+      campaignId: req.body.campaignId,
+      phoneColumn: req.body.phoneColumn,
+      file: req.file,
+      req,
+    });
+    success(res, job, 201);
+  } catch (error) {
+    next(error);
+  } finally {
+    await storage.removePath(req.file?.path);
+  }
+}
+
+async function list(req, res, next) {
+  try {
+    const pagination = parsePagination(req.query);
+    const result = await scrubJobService.listJobs({
+      actor: req.user,
+      pagination,
+      filters: {
+        campaignId: req.query.campaignId,
+        status: req.query.status,
+        agentId: req.query.agentId,
+        jobNumber: req.query.jobId || req.query.jobNumber,
+        filename: req.query.filename,
+        from: req.query.from,
+        to: req.query.to,
+      },
+    });
+    success(res, paginated(result.items, result.total, pagination));
+  } catch (error) {
+    next(error);
+  }
+}
+
+async function get(req, res, next) {
+  try {
+    const job = await scrubJobService.getJob(req.params.id, req.user);
+    success(res, job);
+  } catch (error) {
+    next(error);
+  }
+}
+
+async function cancel(req, res, next) {
+  try {
+    const job = await scrubJobService.cancelJob({
+      actor: req.user,
+      id: req.params.id,
+      req,
+    });
+    success(res, job);
+  } catch (error) {
+    next(error);
+  }
+}
+
+async function exportsList(req, res, next) {
+  try {
+    const job = await scrubJobService.getJob(req.params.id, req.user);
+    success(res, job.exports);
+  } catch (error) {
+    next(error);
+  }
+}
+
+async function download(req, res, next) {
+  try {
+    const exp = await scrubJobService.getExportForDownload(req.params.id, req.user);
+    await scrubJobService.recordDownload({ exportRow: exp, actor: req.user, req });
+    const filename = exp.download_filename || `${exp.export_type}.csv`;
+    res.setHeader('Content-Type', exp.mime_type || 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition');
+    storage.createReadStream(exp.storage_key).pipe(res);
+  } catch (error) {
+    next(error);
+  }
+}
+
+module.exports = { create, list, get, cancel, exportsList, download };

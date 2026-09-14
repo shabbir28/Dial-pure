@@ -1,0 +1,394 @@
+import { useEffect, useMemo, useState } from 'react';
+import { Database, UploadCloud } from 'lucide-react';
+import api from '../services/api';
+import FileDrop from '../components/FileDrop';
+import FilePreview from '../components/FilePreview';
+import Button from '../components/Button';
+import StatusBadge from '../components/StatusBadge';
+import { useToast } from '../components/Toast';
+import { formatNumber } from '../utils/format';
+import {
+  MAX_UPLOAD_BYTES,
+  isCsvFile,
+  previewCsvFile
+} from '../utils/upload';
+
+export default function InternalSales() {
+  const toast = useToast();
+
+  const [campaigns, setCampaigns] = useState([]);
+  const [campaignId, setCampaignId] = useState('');
+  const [campaign, setCampaign] = useState(null);
+
+  const [file, setFile] = useState(null);
+  const [preview, setPreview] = useState(null);
+  const [phoneColumn, setPhoneColumn] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  async function loadCampaigns() {
+    const res = await api.get('/campaigns', {
+      params: { pageSize: 100 }
+    });
+
+    const items = (res.data.items || []).filter(
+      (c) => c.status !== 'archived'
+    );
+
+    setCampaigns(items);
+
+    setCampaignId((current) => {
+      if (current && items.some((c) => c.id === current)) {
+        return current;
+      }
+
+      const active = items.find((c) => c.status === 'active');
+      return active?.id || items[0]?.id || '';
+    });
+  }
+
+  async function loadCampaign(id = campaignId) {
+    if (!id) {
+      setCampaign(null);
+      return;
+    }
+
+    const res = await api.get(`/campaigns/${id}`);
+    setCampaign(res.data);
+  }
+
+  useEffect(() => {
+    loadCampaigns().catch((error) => {
+      toast.push(error.message || 'Could not load campaigns');
+    });
+  }, []);
+
+  useEffect(() => {
+    setFile(null);
+    setPreview(null);
+    setPhoneColumn('');
+
+    if (!campaignId) {
+      setCampaign(null);
+      return;
+    }
+
+    loadCampaign(campaignId).catch((error) => {
+      toast.push(error.message || 'Could not load campaign');
+    });
+  }, [campaignId]);
+
+  // Poll campaign/version status while this page is open.
+  useEffect(() => {
+    if (!campaignId) return undefined;
+
+    const timer = setInterval(() => {
+      loadCampaign(campaignId).catch(() => {});
+    }, 3000);
+
+    return () => clearInterval(timer);
+  }, [campaignId]);
+
+  async function onFile(next) {
+    if (!next) return;
+
+    if (next.size > MAX_UPLOAD_BYTES) {
+      toast.push('File is larger than 500 MB.');
+      return;
+    }
+
+    setFile(next);
+
+    try {
+      if (isCsvFile(next)) {
+        const data = await previewCsvFile(next);
+        setPreview(data);
+        setPhoneColumn(
+          data.suggestedPhoneColumn ||
+          data.headers?.[0] ||
+          ''
+        );
+        return;
+      }
+
+      if (next.size > 32 * 1024 * 1024) {
+        setPreview({
+          headers: ['Phone No'],
+          sampleRows: [],
+          suggestedPhoneColumn: 'Phone No'
+        });
+        setPhoneColumn('Phone No');
+        return;
+      }
+
+      const fd = new FormData();
+      fd.append('file', next);
+
+      const res = await api.post('/files/preview', fd);
+
+      setPreview(res.data);
+      setPhoneColumn(
+        res.data.suggestedPhoneColumn ||
+        res.data.headers?.[0] ||
+        ''
+      );
+    } catch (error) {
+      setFile(null);
+      setPreview(null);
+      toast.push(error.message || 'Could not preview file');
+    }
+  }
+
+  async function uploadInternalSales() {
+    if (!campaignId || !file || !phoneColumn) return;
+
+    setBusy(true);
+
+    try {
+      const fd = new FormData();
+      fd.append('file', file);
+      fd.append('phoneColumn', phoneColumn);
+
+      await api.post(`/campaigns/${campaignId}/master-file`, fd);
+
+      toast.push(
+        'Internal sales uploaded. Processing has started.'
+      );
+
+      setFile(null);
+      setPreview(null);
+      setPhoneColumn('');
+
+      setTimeout(() => {
+        loadCampaign(campaignId).catch(() => {});
+        loadCampaigns().catch(() => {});
+      }, 1200);
+    } catch (error) {
+      toast.push(error.message || 'Internal sales upload failed');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const versions = campaign?.versions || [];
+
+  const latestVersion = useMemo(() => {
+    if (!versions.length) return null;
+
+    return [...versions].sort(
+      (a, b) => Number(b.version_number) - Number(a.version_number)
+    )[0];
+  }, [versions]);
+
+  const activeVersion = useMemo(() => {
+    return versions.find((v) => v.status === 'active') || null;
+  }, [versions]);
+
+  const currentCount =
+    Number(
+      campaign?.active_unique_numbers ??
+      activeVersion?.unique_numbers ??
+      0
+    );
+
+  return (
+    <div>
+      <div className="page-header">
+        <div>
+          <h2 className="page-title">Internal Sales</h2>
+          <p className="page-sub">
+            Upload your own sales suppression list before leads are checked
+            against the client suppression API.
+          </p>
+        </div>
+      </div>
+
+      <div className="card" style={{ marginBottom: 16 }}>
+        <div className="field" style={{ marginBottom: 0 }}>
+          <label>Campaign</label>
+
+          <select
+            className="input"
+            value={campaignId}
+            onChange={(e) => setCampaignId(e.target.value)}
+          >
+            <option value="">Select campaign</option>
+
+            {campaigns.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.campaign_code} · {c.name}
+              </option>
+            ))}
+          </select>
+        </div>
+      </div>
+
+      {campaignId && (
+        <>
+          <div
+            className="card"
+            style={{
+              marginBottom: 16,
+              display: 'grid',
+              gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
+              gap: 16
+            }}
+          >
+            <div>
+              <span className="page-sub">Campaign</span>
+              <div style={{ marginTop: 5 }}>
+                <strong>{campaign?.name || 'Loading...'}</strong>
+              </div>
+            </div>
+
+            <div>
+              <span className="page-sub">Current Internal Sales</span>
+              <div style={{ marginTop: 5, fontSize: '1.35rem' }}>
+                <strong>{formatNumber(currentCount)}</strong>
+              </div>
+            </div>
+
+            <div>
+              <span className="page-sub">Active Version</span>
+              <div style={{ marginTop: 5 }}>
+                {activeVersion ? (
+                  <strong>v{activeVersion.version_number}</strong>
+                ) : (
+                  <strong>—</strong>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="card upload-panel">
+            <div
+              style={{
+                display: 'flex',
+                gap: 12,
+                alignItems: 'center',
+                marginBottom: 14
+              }}
+            >
+              <Database size={22} />
+
+              <div>
+                <h3 style={{ margin: 0 }}>
+                  Upload Internal Sales
+                </h3>
+                <p
+                  className="page-sub"
+                  style={{ margin: '4px 0 0' }}
+                >
+                  These numbers are removed before TLDCRM client suppression.
+                </p>
+              </div>
+            </div>
+
+            <FileDrop file={file} onFile={onFile} />
+
+            {preview && (
+              <div className="field">
+                <label>Phone number column</label>
+
+                <select
+                  className="input"
+                  value={phoneColumn}
+                  onChange={(e) => setPhoneColumn(e.target.value)}
+                >
+                  <option value="">Select phone column</option>
+
+                  {(preview.headers || []).map((h) => (
+                    <option key={h} value={h}>
+                      {h}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+
+            {preview?.sampleRows?.length > 0 && (
+              <FilePreview
+                headers={preview.headers}
+                rows={preview.sampleRows}
+                phoneColumn={phoneColumn}
+              />
+            )}
+
+            <Button
+              type="button"
+              onClick={uploadInternalSales}
+              disabled={
+                busy ||
+                !campaignId ||
+                !file ||
+                !phoneColumn
+              }
+            >
+              <UploadCloud size={16} />
+              {busy ? 'Uploading…' : 'Upload Internal Sales'}
+            </Button>
+          </div>
+
+          <div className="card" style={{ marginTop: 16 }}>
+            <h3>Latest Internal Sales Version</h3>
+
+            {!latestVersion ? (
+              <p className="page-sub">
+                No internal sales file has been uploaded for this campaign.
+              </p>
+            ) : (
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns:
+                    'repeat(5, minmax(0, 1fr))',
+                  gap: 16
+                }}
+              >
+                <div>
+                  <span className="page-sub">Version</span>
+                  <div>
+                    <strong>v{latestVersion.version_number}</strong>
+                  </div>
+                </div>
+
+                <div>
+                  <span className="page-sub">Status</span>
+                  <div style={{ marginTop: 5 }}>
+                    <StatusBadge value={latestVersion.status} />
+                  </div>
+                </div>
+
+                <div>
+                  <span className="page-sub">Total Rows</span>
+                  <div>
+                    <strong>
+                      {formatNumber(latestVersion.total_rows)}
+                    </strong>
+                  </div>
+                </div>
+
+                <div>
+                  <span className="page-sub">Unique Sales</span>
+                  <div>
+                    <strong>
+                      {formatNumber(latestVersion.unique_numbers)}
+                    </strong>
+                  </div>
+                </div>
+
+                <div>
+                  <span className="page-sub">Duplicates</span>
+                  <div>
+                    <strong>
+                      {formatNumber(latestVersion.duplicate_numbers)}
+                    </strong>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}

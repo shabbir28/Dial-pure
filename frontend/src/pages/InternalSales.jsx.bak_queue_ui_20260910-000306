@@ -1,0 +1,850 @@
+import { useEffect, useState } from 'react';
+import {
+  Database,
+  UploadCloud,
+  ShieldCheck,
+  Ban,
+  ListX,
+  CheckCircle2,
+} from 'lucide-react';
+
+import api from '../services/api';
+import FileDrop from '../components/FileDrop';
+import FilePreview from '../components/FilePreview';
+import Button from '../components/Button';
+import StatusBadge from '../components/StatusBadge';
+import { useToast } from '../components/Toast';
+import { formatNumber } from '../utils/format';
+import {
+  MAX_UPLOAD_BYTES,
+  isCsvFile,
+  previewCsvFile,
+} from '../utils/upload';
+
+const LIST_TYPES = [
+  {
+    key: 'sales',
+    title: 'Sales',
+    button: 'Upload Sales',
+    description:
+      'Numbers already sold or converted. These are removed first during scrubbing.',
+    icon: ShieldCheck,
+  },
+  {
+    key: 'dnc_dead',
+    title: 'DNC / Dead',
+    button: 'Upload DNC / Dead',
+    description:
+      'Do-not-call and dead numbers that must be excluded from usable leads.',
+    icon: Ban,
+  },
+  {
+    key: 'suppression',
+    title: 'Suppression',
+    button: 'Upload Suppression',
+    description:
+      'Additional internal suppression numbers that should not pass as clean.',
+    icon: ListX,
+  },
+];
+
+function emptyLists() {
+  return {
+    sales: null,
+    dnc_dead: null,
+    suppression: null,
+  };
+}
+
+function progress(version) {
+  if (!version) return 0;
+
+  const total = Number(version.total_rows || 0);
+  const done = Number(version.processed_rows || 0);
+
+  if (!total) return 0;
+
+  return Math.min(100, Math.round((done / total) * 100));
+}
+
+export default function InternalSales() {
+  const toast = useToast();
+
+  const [campaigns, setCampaigns] = useState([]);
+  const [campaignId, setCampaignId] = useState('');
+
+  const [lists, setLists] = useState(emptyLists());
+  const [loadingLists, setLoadingLists] = useState(false);
+
+  const [selectedType, setSelectedType] = useState(null);
+  const [file, setFile] = useState(null);
+  const [preview, setPreview] = useState(null);
+  const [phoneColumn, setPhoneColumn] = useState('');
+
+  const [busy, setBusy] = useState(false);
+  const [uploadPercent, setUploadPercent] = useState(0);
+
+  async function loadCampaigns() {
+    const res = await api.get('/campaigns', {
+      params: { pageSize: 100 },
+    });
+
+    const items = (res.data.items || []).filter(
+      (item) => item.status !== 'archived'
+    );
+
+    setCampaigns(items);
+
+    setCampaignId((current) => {
+      if (current && items.some((item) => item.id === current)) {
+        return current;
+      }
+
+      const active = items.find((item) => item.status === 'active');
+      return active?.id || items[0]?.id || '';
+    });
+  }
+
+  async function loadLists(id = campaignId) {
+    if (!id) {
+      setLists(emptyLists());
+      return;
+    }
+
+    setLoadingLists(true);
+
+    try {
+      const res = await api.get(`/campaigns/${id}/internal-lists`);
+
+      const data = res.data || {};
+
+      setLists({
+        sales: data.sales || null,
+        dnc_dead: data.dnc_dead || null,
+        suppression: data.suppression || null,
+      });
+    } catch (error) {
+      /*
+       * The GET summary endpoint is added in the backend next.
+       * Until then, keep the page usable instead of breaking on 404.
+       */
+      if (error?.response?.status === 404) {
+        setLists(emptyLists());
+        return;
+      }
+
+      throw error;
+    } finally {
+      setLoadingLists(false);
+    }
+  }
+
+  useEffect(() => {
+    loadCampaigns().catch((error) => {
+      toast.push(error.message || 'Could not load campaigns');
+    });
+  }, []);
+
+  useEffect(() => {
+    setSelectedType(null);
+    resetUpload();
+
+    if (!campaignId) {
+      setLists(emptyLists());
+      return;
+    }
+
+    loadLists(campaignId).catch((error) => {
+      toast.push(error.message || 'Could not load internal lists');
+    });
+  }, [campaignId]);
+
+  useEffect(() => {
+    if (!campaignId) return undefined;
+
+    const timer = setInterval(() => {
+      loadLists(campaignId).catch(() => {});
+    }, 3000);
+
+    return () => clearInterval(timer);
+  }, [campaignId]);
+
+  function resetUpload() {
+    setFile(null);
+    setPreview(null);
+    setPhoneColumn('');
+    setUploadPercent(0);
+  }
+
+  function openUpload(type) {
+    setSelectedType(type);
+    resetUpload();
+  }
+
+  function closeUpload() {
+    if (busy) return;
+
+    setSelectedType(null);
+    resetUpload();
+  }
+
+  async function onFile(next) {
+    if (!next) return;
+
+    if (next.size > MAX_UPLOAD_BYTES) {
+      toast.push('File is larger than 500 MB.');
+      return;
+    }
+
+    setFile(next);
+
+    try {
+      if (isCsvFile(next)) {
+        const data = await previewCsvFile(next);
+
+        setPreview(data);
+
+        setPhoneColumn(
+          data.suggestedPhoneColumn ||
+          data.headers?.[0] ||
+          ''
+        );
+
+        return;
+      }
+
+      if (next.size > 32 * 1024 * 1024) {
+        setPreview({
+          headers: ['Phone No'],
+          sampleRows: [],
+          suggestedPhoneColumn: 'Phone No',
+        });
+
+        setPhoneColumn('Phone No');
+        return;
+      }
+
+      const fd = new FormData();
+      fd.append('file', next);
+
+      const res = await api.post('/files/preview', fd);
+
+      setPreview(res.data);
+
+      setPhoneColumn(
+        res.data.suggestedPhoneColumn ||
+        res.data.headers?.[0] ||
+        ''
+      );
+    } catch (error) {
+      resetUpload();
+      toast.push(error.message || 'Could not preview file');
+    }
+  }
+
+  async function uploadList() {
+    if (
+      !campaignId ||
+      !selectedType ||
+      !file ||
+      !phoneColumn
+    ) {
+      return;
+    }
+
+    setBusy(true);
+    setUploadPercent(0);
+
+    try {
+      const fd = new FormData();
+
+      fd.append('file', file);
+      fd.append('phoneColumn', phoneColumn);
+
+      await api.post(
+        `/campaigns/${campaignId}/internal-lists/${selectedType}`,
+        fd,
+        {
+          onUploadProgress: (event) => {
+            if (!event.total) return;
+
+            setUploadPercent(
+              Math.min(
+                100,
+                Math.round(
+                  (event.loaded / event.total) * 100
+                )
+              )
+            );
+          },
+        }
+      );
+
+      const config = LIST_TYPES.find(
+        (item) => item.key === selectedType
+      );
+
+      toast.push(
+        `${config?.title || 'Internal list'} uploaded. Processing has started.`
+      );
+
+      setSelectedType(null);
+      resetUpload();
+
+      setTimeout(() => {
+        loadLists(campaignId).catch(() => {});
+      }, 1000);
+    } catch (error) {
+      toast.push(
+        error.message || 'Internal list upload failed'
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const selectedConfig = LIST_TYPES.find(
+    (item) => item.key === selectedType
+  );
+
+  return (
+    <div>
+      <div className="page-header">
+        <div>
+          <h2 className="page-title">
+            Internal Suppression Lists
+          </h2>
+
+          <p className="page-sub">
+            Manage Sales, DNC / Dead and Suppression lists
+            separately for each campaign.
+          </p>
+        </div>
+      </div>
+
+      <div
+        className="card"
+        style={{ marginBottom: 16 }}
+      >
+        <div
+          className="field"
+          style={{ marginBottom: 0 }}
+        >
+          <label>Campaign</label>
+
+          <select
+            className="input"
+            value={campaignId}
+            onChange={(e) =>
+              setCampaignId(e.target.value)
+            }
+          >
+            <option value="">
+              Select campaign
+            </option>
+
+            {campaigns.map((campaign) => (
+              <option
+                key={campaign.id}
+                value={campaign.id}
+              >
+                {campaign.campaign_code} ·{' '}
+                {campaign.name}
+              </option>
+            ))}
+          </select>
+        </div>
+      </div>
+
+      {campaignId && (
+        <>
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns:
+                'repeat(auto-fit, minmax(280px, 1fr))',
+              gap: 16,
+            }}
+          >
+            {LIST_TYPES.map((config) => {
+              const Icon = config.icon;
+              const version = lists[config.key];
+              const percent = progress(version);
+              const processing =
+                version?.status === 'processing';
+
+              return (
+                <div
+                  key={config.key}
+                  className="card"
+                  style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    minHeight: 330,
+                  }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 12,
+                      marginBottom: 14,
+                    }}
+                  >
+                    <div
+                      style={{
+                        width: 42,
+                        height: 42,
+                        borderRadius: 10,
+                        display: 'grid',
+                        placeItems: 'center',
+                        background:
+                          'var(--color-surface-soft, var(--color-border))',
+                      }}
+                    >
+                      <Icon size={21} />
+                    </div>
+
+                    <div>
+                      <h3
+                        style={{
+                          margin: 0,
+                          fontSize: '1.05rem',
+                        }}
+                      >
+                        {config.title}
+                      </h3>
+
+                      <div
+                        className="page-sub"
+                        style={{ marginTop: 3 }}
+                      >
+                        {version
+                          ? `Version v${version.version_number}`
+                          : 'No active list'}
+                      </div>
+                    </div>
+                  </div>
+
+                  <p
+                    className="page-sub"
+                    style={{
+                      minHeight: 42,
+                      marginTop: 0,
+                    }}
+                  >
+                    {config.description}
+                  </p>
+
+                  {loadingLists && !version ? (
+                    <div
+                      className="page-sub"
+                      style={{ marginTop: 12 }}
+                    >
+                      Loading…
+                    </div>
+                  ) : version ? (
+                    <>
+                      <div
+                        style={{
+                          display: 'grid',
+                          gridTemplateColumns:
+                            'repeat(2, minmax(0,1fr))',
+                          gap: 12,
+                          marginTop: 8,
+                        }}
+                      >
+                        <div>
+                          <span className="page-sub">
+                            Status
+                          </span>
+
+                          <div
+                            style={{
+                              marginTop: 4,
+                            }}
+                          >
+                            {processing ? (
+                              <strong>
+                                Processing
+                              </strong>
+                            ) : (
+                              <StatusBadge
+                                value={
+                                  version.status
+                                }
+                              />
+                            )}
+                          </div>
+                        </div>
+
+                        <div>
+                          <span className="page-sub">
+                            Unique Numbers
+                          </span>
+
+                          <div
+                            style={{
+                              marginTop: 4,
+                              fontSize: '1.15rem',
+                            }}
+                          >
+                            <strong>
+                              {formatNumber(
+                                version.unique_numbers
+                              )}
+                            </strong>
+                          </div>
+                        </div>
+
+                        <div>
+                          <span className="page-sub">
+                            Total Rows
+                          </span>
+
+                          <div>
+                            <strong>
+                              {formatNumber(
+                                version.total_rows
+                              )}
+                            </strong>
+                          </div>
+                        </div>
+
+                        <div>
+                          <span className="page-sub">
+                            Duplicates
+                          </span>
+
+                          <div>
+                            <strong>
+                              {formatNumber(
+                                version.duplicate_numbers
+                              )}
+                            </strong>
+                          </div>
+                        </div>
+
+                        <div>
+                          <span className="page-sub">
+                            Invalid
+                          </span>
+
+                          <div>
+                            <strong>
+                              {formatNumber(
+                                version.invalid_numbers
+                              )}
+                            </strong>
+                          </div>
+                        </div>
+                      </div>
+
+                      {processing && (
+                        <div
+                          style={{ marginTop: 16 }}
+                        >
+                          <div
+                            style={{
+                              display: 'flex',
+                              justifyContent:
+                                'space-between',
+                              marginBottom: 6,
+                            }}
+                          >
+                            <span className="page-sub">
+                              Processing
+                            </span>
+
+                            <strong>
+                              {percent}%
+                            </strong>
+                          </div>
+
+                          <div
+                            style={{
+                              height: 9,
+                              width: '100%',
+                              borderRadius: 999,
+                              background:
+                                'var(--color-border)',
+                              overflow: 'hidden',
+                            }}
+                          >
+                            <div
+                              style={{
+                                height: '100%',
+                                width: `${Math.max(
+                                  percent,
+                                  2
+                                )}%`,
+                                background:
+                                  'var(--color-success)',
+                                transition:
+                                  'width .3s ease',
+                              }}
+                            />
+                          </div>
+
+                          <div
+                            className="page-sub"
+                            style={{
+                              marginTop: 6,
+                              fontSize: '.8rem',
+                            }}
+                          >
+                            {formatNumber(
+                              version.processed_rows
+                            )}{' '}
+                            /{' '}
+                            {formatNumber(
+                              version.total_rows
+                            )}{' '}
+                            rows
+                          </div>
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    <div
+                      style={{
+                        flex: 1,
+                        display: 'grid',
+                        placeItems: 'center',
+                        textAlign: 'center',
+                        minHeight: 120,
+                      }}
+                    >
+                      <div>
+                        <Database
+                          size={28}
+                          style={{
+                            opacity: 0.35,
+                          }}
+                        />
+
+                        <p
+                          className="page-sub"
+                          style={{
+                            marginBottom: 0,
+                          }}
+                        >
+                          No {config.title} list
+                          uploaded yet.
+                        </p>
+                      </div>
+                    </div>
+                  )}
+
+                  <div
+                    style={{
+                      marginTop: 'auto',
+                      paddingTop: 18,
+                    }}
+                  >
+                    <Button
+                      type="button"
+                      onClick={() =>
+                        openUpload(config.key)
+                      }
+                      disabled={busy}
+                    >
+                      <UploadCloud size={16} />
+                      {config.button}
+                    </Button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {selectedType && (
+            <div
+              className="card upload-panel"
+              style={{ marginTop: 16 }}
+            >
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent:
+                    'space-between',
+                  alignItems: 'flex-start',
+                  gap: 16,
+                  marginBottom: 16,
+                }}
+              >
+                <div>
+                  <h3 style={{ margin: 0 }}>
+                    {selectedConfig?.button}
+                  </h3>
+
+                  <p
+                    className="page-sub"
+                    style={{
+                      margin: '5px 0 0',
+                    }}
+                  >
+                    Upload CSV or XLSX and
+                    select the phone number
+                    column.
+                  </p>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={closeUpload}
+                  disabled={busy}
+                  style={{
+                    border: 0,
+                    background: 'transparent',
+                    cursor: busy
+                      ? 'not-allowed'
+                      : 'pointer',
+                    fontSize: '1.35rem',
+                    opacity: 0.7,
+                  }}
+                >
+                  ×
+                </button>
+              </div>
+
+              <FileDrop
+                file={file}
+                onFile={onFile}
+              />
+
+              {preview && (
+                <div
+                  className="field"
+                  style={{ marginTop: 16 }}
+                >
+                  <label>
+                    Phone number column
+                  </label>
+
+                  <select
+                    className="input"
+                    value={phoneColumn}
+                    onChange={(e) =>
+                      setPhoneColumn(
+                        e.target.value
+                      )
+                    }
+                  >
+                    <option value="">
+                      Select phone column
+                    </option>
+
+                    {(preview.headers || []).map(
+                      (header) => (
+                        <option
+                          key={header}
+                          value={header}
+                        >
+                          {header}
+                        </option>
+                      )
+                    )}
+                  </select>
+                </div>
+              )}
+
+              {preview?.sampleRows?.length >
+                0 && (
+                <FilePreview
+                  headers={preview.headers}
+                  rows={preview.sampleRows}
+                  phoneColumn={phoneColumn}
+                />
+              )}
+
+              <div
+                style={{
+                  display: 'flex',
+                  gap: 10,
+                  marginTop: 16,
+                }}
+              >
+                <Button
+                  type="button"
+                  onClick={uploadList}
+                  disabled={
+                    busy ||
+                    !file ||
+                    !phoneColumn
+                  }
+                >
+                  {busy ? (
+                    <>
+                      <UploadCloud size={16} />
+                      Uploading…
+                    </>
+                  ) : (
+                    <>
+                      <CheckCircle2 size={16} />
+                      {selectedConfig?.button}
+                    </>
+                  )}
+                </Button>
+
+                {!busy && (
+                  <Button
+                    type="button"
+                    onClick={closeUpload}
+                  >
+                    Cancel
+                  </Button>
+                )}
+              </div>
+
+              {busy && (
+                <div
+                  style={{ marginTop: 16 }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent:
+                        'space-between',
+                      marginBottom: 6,
+                    }}
+                  >
+                    <span className="page-sub">
+                      Uploading file
+                    </span>
+
+                    <strong>
+                      {uploadPercent}%
+                    </strong>
+                  </div>
+
+                  <div
+                    style={{
+                      width: '100%',
+                      height: 10,
+                      background:
+                        'var(--color-border)',
+                      borderRadius: 999,
+                      overflow: 'hidden',
+                    }}
+                  >
+                    <div
+                      style={{
+                        width: `${uploadPercent}%`,
+                        height: '100%',
+                        background:
+                          'var(--color-success)',
+                        transition:
+                          'width .25s ease',
+                      }}
+                    />
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}

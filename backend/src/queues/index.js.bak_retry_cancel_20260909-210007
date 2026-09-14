@@ -1,0 +1,37 @@
+'use strict';
+
+const processors = {
+  'scrub-job': (data) => require('../workers/processors').processScrubJob(data),
+  'campaign-master': (data) => require('../workers/processors').processCampaignMaster(data),
+};
+
+const memoryQueue = [];
+let draining = false;
+
+async function drainMemory() {
+  if (draining) return;
+  draining = true;
+  while (memoryQueue.length) {
+    const item = memoryQueue.shift();
+    try {
+      await processors[item.name](item.data);
+    } catch (error) {
+      console.error(`Job ${item.name} failed:`, error);
+    }
+  }
+  draining = false;
+}
+
+async function enqueue(name, data) {
+  if (!processors[name]) {
+    throw new Error(`Unknown queue job: ${name}`);
+  }
+  memoryQueue.push({ name, data });
+  setImmediate(drainMemory);
+}
+
+async function initQueues() {
+  console.log('Background job queue ready (in-process).');
+}
+
+module.exports = { enqueue, initQueues };

@@ -1,0 +1,741 @@
+'use strict';
+
+const { query, queryRaw } = require('../config/database');
+const { uuid, jobNumber } = require('../utils/ids');
+const { AppError } = require('../utils/response');
+const { detectExtension, allowedMime } = require('../utils/fileDetect');
+const storage = require('./storageService');
+const settings = require('./settingsService');
+const config = require('../config');
+const campaignService = require('./campaignService');
+const audit = require('./auditService');
+const { enqueue } = require('../queues');
+const { sqlLimit } = require('../utils/pagination');
+
+function clientIp(req) {
+  return (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+}
+
+function slugName(firstName, lastName) {
+  const raw = [firstName, lastName].filter(Boolean).join('_');
+  const slug = raw.replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+  return slug || 'agent';
+}
+
+function downloadFilename(exportType, firstName, lastName) {
+  const type = String(exportType || 'export').replace(/[^a-zA-Z0-9]+/g, '');
+  return `${slugName(firstName, lastName)}_${type}.csv`;
+}
+
+async function createFileRecord({
+  originalFilename,
+  stored,
+  fileType,
+  mimeType,
+  extension,
+  checksum,
+  user,
+  ip,
+  rowCount,
+}) {
+  const id = uuid();
+  await query(
+    `INSERT INTO files (
+      id, file_uuid, original_filename, stored_filename, storage_provider, storage_bucket,
+      storage_key, file_type, mime_type, extension, file_size_bytes, checksum_sha256,
+      uploaded_by, uploaded_ip, row_count, processing_status
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      id,
+      uuid(),
+      originalFilename,
+      stored.storedFilename,
+      stored.provider,
+      stored.bucket,
+      stored.key,
+      fileType,
+      mimeType,
+      extension,
+      stored.size,
+      checksum,
+      user.id,
+      ip,
+      rowCount || null,
+      'stored',
+    ]
+  );
+  return id;
+}
+
+async function validateUpload(file) {
+  const maxSize = config.maxUploadBytes;
+  const allowed = (await settings.get('ALLOWED_FILE_TYPES')) || ['csv', 'xlsx'];
+  if (!file) throw new AppError('FILE_REQUIRED', 'A CSV or XLSX file is required.', 400);
+  if ((file.size || 0) > maxSize) throw new AppError('FILE_TOO_LARGE', 'File is larger than 500 MB.', 413);
+  const extension = detectExtension(file.originalname);
+  if (!allowed.includes(extension)) {
+    throw new AppError('INVALID_FILE_TYPE', 'Only CSV and XLSX files are allowed.', 400);
+  }
+  if (!allowedMime(extension, file.mimetype)) {
+    throw new AppError('INVALID_FILE_TYPE', 'File MIME type does not match the extension.', 400);
+  }
+  return extension;
+}
+
+async function createMasterUpload({ actor, campaignId, file, phoneColumn, req }) {
+  const campaign = await campaignService.getCampaign(campaignId, actor);
+  const extension = await validateUpload(file);
+  const ip = clientIp(req);
+  const stored = await storage.saveFromPath({
+    sourcePath: file.path,
+    folder: `campaigns/${campaignId}/masters`,
+    extension,
+    size: file.size,
+  });
+  const checksum = stored.checksum;
+  const fileId = await createFileRecord({
+    originalFilename: file.originalname,
+    stored,
+    fileType: 'campaign_master',
+    mimeType: file.mimetype,
+    extension,
+    checksum,
+    user: actor,
+    ip,
+  });
+
+  const emptyVersion = await query(
+    `SELECT id, version_number FROM campaign_versions
+     WHERE campaign_id = ? AND source_file_id IS NULL
+     ORDER BY version_number ASC
+     LIMIT 1`,
+    [campaignId]
+  );
+
+  let versionId;
+  let versionNumber;
+  if (emptyVersion.length) {
+    versionId = emptyVersion[0].id;
+    versionNumber = Number(emptyVersion[0].version_number);
+    await query(
+      `UPDATE campaign_versions
+       SET source_file_id = ?, status = 'processing', created_by = ?
+       WHERE id = ?`,
+      [fileId, actor.id, versionId]
+    );
+  } else {
+    const versionRows = await query(
+      `SELECT COALESCE(MAX(version_number), 0) AS maxv FROM campaign_versions WHERE campaign_id = ?`,
+      [campaignId]
+    );
+    versionNumber = Number(versionRows[0].maxv) + 1;
+    versionId = uuid();
+    await query(
+      `INSERT INTO campaign_versions (id, campaign_id, version_number, source_file_id, status, created_by)
+       VALUES (?, ?, ?, ?, 'processing', ?)`,
+      [versionId, campaignId, versionNumber, fileId, actor.id]
+    );
+  }
+
+  await audit.write({
+    requestId: req.requestId,
+    actorUserId: actor.id,
+    actorRole: actor.role,
+    action: 'MASTER_FILE_UPLOADED',
+    entityType: 'campaign_version',
+    entityId: versionId,
+    description: `Uploaded master file ${file.originalname} as version ${versionNumber}`,
+    metadata: {
+      campaignId,
+      campaignName: campaign.name,
+      versionNumber,
+      filename: file.originalname,
+      checksum,
+    },
+    ipAddress: ip,
+    userAgent: req.headers['user-agent'],
+  });
+
+  await enqueue('campaign-master', {
+    versionId,
+    campaignId,
+    fileId,
+    phoneColumn: phoneColumn || null,
+    actorId: actor.id,
+    requestId: req.requestId,
+  });
+
+  return {
+    campaignId,
+    versionId,
+    versionNumber,
+    fileId,
+    status: 'processing',
+  };
+}
+
+
+
+async function getInternalLists({ actor, campaignId }) {
+  await campaignService.getCampaign(campaignId, actor);
+
+  const rows = await query(
+    `SELECT ilv.*
+     FROM internal_list_versions ilv
+     JOIN (
+       SELECT
+         list_type,
+         MAX(version_number) AS max_version
+       FROM internal_list_versions
+       WHERE campaign_id = ?
+       GROUP BY list_type
+     ) latest
+       ON latest.list_type = ilv.list_type
+      AND latest.max_version = ilv.version_number
+     WHERE ilv.campaign_id = ?`,
+    [campaignId, campaignId]
+  );
+
+  const result = {
+    sales: null,
+    dnc_dead: null,
+    suppression: null,
+  };
+
+  for (const row of rows) {
+    result[row.list_type] = row;
+  }
+
+  const history = await query(
+    `SELECT
+       ilv.id,
+       ilv.campaign_id,
+       ilv.list_type,
+       ilv.version_number,
+       ilv.phone_column_name,
+       ilv.status,
+       ilv.total_rows,
+       ilv.processed_rows,
+       ilv.valid_numbers,
+       ilv.invalid_numbers,
+       ilv.duplicate_numbers,
+       ilv.unique_numbers,
+       ilv.created_at,
+       ilv.activated_at,
+       ilv.failure_reason,
+       f.original_filename,
+       f.file_size_bytes,
+       u.first_name,
+       u.last_name,
+       u.email
+     FROM internal_list_versions ilv
+     LEFT JOIN files f ON f.id = ilv.source_file_id
+     LEFT JOIN users u ON u.id = ilv.created_by
+     WHERE ilv.campaign_id = ?
+       AND ilv.list_type IN ('sales', 'suppression')
+     ORDER BY ilv.created_at DESC`,
+    [campaignId]
+  );
+
+  return {
+    sales: result.sales,
+    dnc_dead: result.dnc_dead,
+    suppression: result.suppression,
+    history,
+  };
+}
+
+async function createInternalListUpload({
+  actor,
+  campaignId,
+  listType,
+  file,
+  phoneColumn,
+  req
+}) {
+  const allowedTypes = ['sales', 'dnc_dead', 'suppression'];
+
+  if (!allowedTypes.includes(listType)) {
+    throw new AppError(
+      'INVALID_INTERNAL_LIST_TYPE',
+      'Invalid internal list type.',
+      400
+    );
+  }
+
+  const campaign = await campaignService.getCampaign(campaignId, actor);
+
+  const runningInternalList = await query(
+    `SELECT id, campaign_id, list_type, version_number
+     FROM internal_list_versions
+     WHERE created_by = ?
+       AND status = 'processing'
+     LIMIT 1`,
+    [actor.id]
+  );
+
+  if (runningInternalList.length) {
+    throw new AppError(
+      'INTERNAL_LIST_PROCESSING',
+      'You already have an internal list processing. Please wait until it completes.',
+      409
+    );
+  }
+
+  const extension = await validateUpload(file);
+  const ip = clientIp(req);
+
+  const stored = await storage.saveFromPath({
+    sourcePath: file.path,
+    folder: `campaigns/${campaignId}/internal-lists/${listType}`,
+    extension,
+    size: file.size,
+  });
+  const checksum = stored.checksum;
+  const fileId = await createFileRecord({
+    originalFilename: file.originalname,
+    stored,
+    fileType: 'campaign_master',
+    mimeType: file.mimetype,
+    extension,
+    checksum,
+    user: actor,
+    ip,
+  });
+
+  const versionRows = await query(
+    `SELECT COALESCE(MAX(version_number), 0) AS maxv
+     FROM internal_list_versions
+     WHERE campaign_id = ?
+       AND list_type = ?`,
+    [campaignId, listType]
+  );
+
+  const versionNumber = Number(versionRows[0].maxv || 0) + 1;
+  const versionId = uuid();
+
+  await query(
+    `INSERT INTO internal_list_versions (
+      id,
+      campaign_id,
+      list_type,
+      version_number,
+      source_file_id,
+      phone_column_name,
+      status,
+      created_by
+    )
+    VALUES (?, ?, ?, ?, ?, ?, 'processing', ?)`,
+    [
+      versionId,
+      campaignId,
+      listType,
+      versionNumber,
+      fileId,
+      phoneColumn || null,
+      actor.id
+    ]
+  );
+
+  await audit.write({
+    requestId: req.requestId,
+    actorUserId: actor.id,
+    actorRole: actor.role,
+    action: 'INTERNAL_LIST_UPLOADED',
+    entityType: 'internal_list_version',
+    entityId: versionId,
+    description: `Uploaded ${listType} internal list ${file.originalname} as version ${versionNumber}`,
+    metadata: {
+      campaignId,
+      campaignName: campaign.name,
+      listType,
+      versionNumber,
+      filename: file.originalname,
+      checksum,
+      phoneColumn: phoneColumn || null,
+    },
+    ipAddress: ip,
+    userAgent: req.headers['user-agent'],
+  });
+
+  await enqueue('internal-list', {
+    versionId,
+    campaignId,
+    listType,
+    fileId,
+    phoneColumn: phoneColumn || null,
+    actorId: actor.id,
+    requestId: req.requestId,
+  });
+
+  return {
+    campaignId,
+    listType,
+    versionId,
+    versionNumber,
+    fileId,
+    status: 'processing',
+  };
+}
+
+async function createScrubJob({ actor, campaignId, file, phoneColumn, req }) {
+  if (!phoneColumn) {
+    throw new AppError('PHONE_COLUMN_REQUIRED', 'Select the phone-number column before starting a scrub.', 400);
+  }
+  const campaigns = await query(`SELECT id, status FROM campaigns WHERE id = ?`, [campaignId]);
+  if (!campaigns.length) {
+    throw new AppError('CAMPAIGN_NOT_FOUND', 'Campaign not found.', 404);
+  }
+  if (campaigns[0].status !== 'active') {
+    throw new AppError('CAMPAIGN_INACTIVE', 'This campaign is not active.', 400);
+  }
+
+  // One active scrub per user.
+  // Different users are still allowed to scrub in parallel.
+  const existingActiveJob = await query(
+    `SELECT id, job_number, status
+     FROM scrub_jobs
+     WHERE uploaded_by = ?
+       AND status IN (
+         'queued',
+         'validating',
+         'processing',
+         'generating_exports'
+       )
+     ORDER BY created_at ASC
+     LIMIT 1`,
+    [actor.id]
+  );
+
+  if (existingActiveJob.length) {
+    throw new AppError(
+      'SCRUB_ALREADY_PROCESSING',
+      `You already have a scrub job in progress (${existingActiveJob[0].job_number}). Please wait until it completes.`,
+      409
+    );
+  }
+
+  const active = await campaignService.getActiveVersion(campaignId);
+
+  const extension = await validateUpload(file);
+  const ip = clientIp(req);
+  const stored = await storage.saveFromPath({
+    sourcePath: file.path,
+    folder: `jobs/${actor.id}`,
+    extension,
+    size: file.size,
+  });
+  const checksum = stored.checksum;
+  const fileId = await createFileRecord({
+    originalFilename: file.originalname,
+    stored,
+    fileType: 'scrub_input',
+    mimeType: file.mimetype,
+    extension,
+    checksum,
+    user: actor,
+    ip,
+  });
+
+  const id = uuid();
+  const number = jobNumber();
+  await query(
+    `INSERT INTO scrub_jobs (
+      id, job_number, campaign_id, campaign_version_id, uploaded_by, input_file_id,
+      phone_column_name, status, created_ip, created_user_agent
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`,
+    [id, number, campaignId, active.id, actor.id, fileId, phoneColumn, ip, req.headers['user-agent'] || null]
+  );
+
+  await audit.write({
+    requestId: req.requestId,
+    actorUserId: actor.id,
+    actorRole: actor.role,
+    action: 'SCRUB_JOB_CREATED',
+    entityType: 'scrub_job',
+    entityId: id,
+    description: `Created ${number} using campaign version ${active.version_number}`,
+    metadata: {
+      jobNumber: number,
+      campaignId,
+      campaignVersionId: active.id,
+      campaignVersion: active.version_number,
+      filename: file.originalname,
+      checksum,
+      phoneColumn,
+    },
+    ipAddress: ip,
+    userAgent: req.headers['user-agent'],
+  });
+
+  await enqueue('scrub-job', { jobId: id, requestId: req.requestId });
+  return getJob(id, actor);
+}
+
+function jobVisibilityClause(actor) {
+  if (actor.role === 'admin') return { sql: '', params: [] };
+  return { sql: 'AND j.uploaded_by = ?', params: [actor.id] };
+}
+
+async function listJobs({ actor, filters, pagination }) {
+  const vis = jobVisibilityClause(actor);
+  const where = ['1=1'];
+  const params = [];
+  if (vis.sql) {
+    where.push('j.uploaded_by = ?');
+    params.push(actor.id);
+  }
+  if (filters.campaignId) {
+    where.push('j.campaign_id = ?');
+    params.push(filters.campaignId);
+  }
+  if (filters.status) {
+    where.push('j.status = ?');
+    params.push(filters.status);
+  }
+  if (filters.agentId && actor.role === 'admin') {
+    where.push('j.uploaded_by = ?');
+    params.push(filters.agentId);
+  }
+  if (filters.jobNumber) {
+    where.push('j.job_number LIKE ?');
+    params.push(`%${filters.jobNumber}%`);
+  }
+  if (filters.filename) {
+    where.push('f.original_filename LIKE ?');
+    params.push(`%${filters.filename}%`);
+  }
+  if (filters.from) {
+    where.push('j.created_at >= ?');
+    params.push(filters.from);
+  }
+  if (filters.to) {
+    where.push('j.created_at <= ?');
+    params.push(filters.to);
+  }
+  const clause = `WHERE ${where.join(' AND ')}`;
+  const count = await query(
+    `SELECT COUNT(*) AS total
+     FROM scrub_jobs j
+     JOIN files f ON f.id = j.input_file_id
+     ${clause}`,
+    params
+  );
+  const items = await queryRaw(
+    `SELECT j.*, c.name AS campaign_name, c.campaign_code,
+            cv.version_number, f.original_filename, f.checksum_sha256,
+            u.first_name, u.last_name, u.email
+     FROM scrub_jobs j
+     JOIN campaigns c ON c.id = j.campaign_id
+     JOIN campaign_versions cv ON cv.id = j.campaign_version_id
+     JOIN files f ON f.id = j.input_file_id
+     JOIN users u ON u.id = j.uploaded_by
+     ${clause}
+     ORDER BY j.created_at DESC
+     ${sqlLimit(pagination)}`,
+    params
+  );
+  return { items, total: count[0].total };
+}
+
+async function getJob(id, actor) {
+  const vis = jobVisibilityClause(actor);
+  const rows = await queryRaw(
+    `SELECT j.*, c.name AS campaign_name, c.campaign_code,
+            cv.version_number, cv.unique_numbers AS version_unique_numbers,
+            f.original_filename, f.checksum_sha256, f.file_size_bytes, f.storage_key,
+            u.first_name, u.last_name, u.email, u.user_code
+     FROM scrub_jobs j
+     JOIN campaigns c ON c.id = j.campaign_id
+     JOIN campaign_versions cv ON cv.id = j.campaign_version_id
+     JOIN files f ON f.id = j.input_file_id
+     JOIN users u ON u.id = j.uploaded_by
+     WHERE j.id = ? ${vis.sql}
+     LIMIT 1`,
+    [id, ...vis.params]
+  );
+  if (!rows.length) throw new AppError('JOB_NOT_FOUND', 'Scrub job not found.', 404);
+  const job = rows[0];
+  const exportsList = await queryRaw(
+    `SELECT e.*, fi.original_filename, fi.file_size_bytes, fi.checksum_sha256
+     FROM exports e
+     JOIN files fi ON fi.id = e.file_id
+     WHERE e.job_id = ?
+     ORDER BY e.export_type`,
+    [id]
+  );
+  const downloads = await queryRaw(
+    `SELECT d.*, u.first_name, u.last_name, u.email, e.export_type
+     FROM download_events d
+     JOIN users u ON u.id = d.downloaded_by
+     JOIN exports e ON e.id = d.export_id
+     WHERE d.job_id = ?
+     ORDER BY d.downloaded_at DESC
+     LIMIT 50`,
+    [id]
+  );
+  let priorSameFile = [];
+  if (job.checksum_sha256) {
+    const priorWhere = [
+      'j.campaign_id = ?',
+      'j.campaign_version_id = ?',
+      'f.checksum_sha256 = ?',
+      'j.id <> ?',
+    ];
+    const priorParams = [job.campaign_id, job.campaign_version_id, job.checksum_sha256, id];
+    if (actor.role !== 'admin') {
+      priorWhere.push('j.uploaded_by = ?');
+      priorParams.push(actor.id);
+    }
+    priorSameFile = await queryRaw(
+      `SELECT j.id, j.job_number, j.created_at, j.status
+       FROM scrub_jobs j
+       JOIN files f ON f.id = j.input_file_id
+       WHERE ${priorWhere.join(' AND ')}
+       ORDER BY j.created_at DESC
+       LIMIT 5`,
+      priorParams
+    );
+  }
+  return { ...job, exports: exportsList, downloads, priorSameFile };
+}
+
+async function cancelJob({ actor, id, req }) {
+  const job = await getJob(id, actor);
+  if (['completed', 'failed', 'cancelled'].includes(job.status)) {
+    throw new AppError('JOB_NOT_CANCELLABLE', 'This job can no longer be cancelled.', 400);
+  }
+  await query(`UPDATE scrub_jobs SET status = 'cancelled', updated_at = NOW() WHERE id = ?`, [id]);
+  await audit.write({
+    requestId: req.requestId,
+    actorUserId: actor.id,
+    actorRole: actor.role,
+    action: 'SCRUB_JOB_CANCELLED',
+    entityType: 'scrub_job',
+    entityId: id,
+    ipAddress: clientIp(req),
+    userAgent: req.headers['user-agent'],
+  });
+  return getJob(id, actor);
+}
+
+
+async function restartJob({ actor, id, req }) {
+  const job = await getJob(id, actor);
+
+  if (job.status === 'completed') {
+    throw new AppError(
+      'JOB_ALREADY_COMPLETED',
+      'Completed jobs do not need to be restarted.',
+      400
+    );
+  }
+
+  // Mark it cancelled first. If an old worker is still alive,
+  // it will stop at its next cancellation checkpoint.
+  await query(
+    `UPDATE scrub_jobs
+     SET status = 'cancelled',
+         updated_at = NOW()
+     WHERE id = ?`,
+    [id]
+  );
+
+  const queued = await enqueue('scrub-job', {
+    jobId: id,
+    requestId: req.requestId,
+    restart: true,
+  });
+
+  await audit.write({
+    requestId: req.requestId,
+    actorUserId: actor.id,
+    actorRole: actor.role,
+    action: 'SCRUB_JOB_RESTART_REQUESTED',
+    entityType: 'scrub_job',
+    entityId: id,
+    metadata: {
+      previousStatus: job.status,
+      queued,
+    },
+    ipAddress: clientIp(req),
+    userAgent: req.headers['user-agent'],
+  });
+
+  return getJob(id, actor);
+}
+
+async function getExportForDownload(exportId, actor) {
+  const rows = await queryRaw(
+    `SELECT e.*, j.uploaded_by, j.job_number, f.storage_key, f.original_filename, f.mime_type,
+            u.first_name, u.last_name
+     FROM exports e
+     JOIN scrub_jobs j ON j.id = e.job_id
+     JOIN files f ON f.id = e.file_id
+     JOIN users u ON u.id = j.uploaded_by
+     WHERE e.id = ? LIMIT 1`,
+    [exportId]
+  );
+  if (!rows.length) throw new AppError('EXPORT_NOT_FOUND', 'Export not found.', 404);
+  const exp = rows[0];
+
+  if (exp.export_type === 'external_matched' && actor.role !== 'admin') {
+    throw new AppError(
+      'FORBIDDEN',
+      'Client matched export is available to administrators only.',
+      403
+    );
+  }
+
+  if (actor.role !== 'admin' && exp.uploaded_by !== actor.id) {
+    throw new AppError('FORBIDDEN', 'You cannot download another agent\'s files.', 403);
+  }
+  exp.download_filename = downloadFilename(exp.export_type, exp.first_name, exp.last_name);
+  return exp;
+}
+
+async function recordDownload({ exportRow, actor, req }) {
+  const id = uuid();
+  await query(
+    `INSERT INTO download_events (id, export_id, job_id, downloaded_by, ip_address, user_agent)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [id, exportRow.id, exportRow.job_id, actor.id, clientIp(req), req.headers['user-agent'] || null]
+  );
+  await query(
+    `UPDATE exports SET download_count = download_count + 1, last_downloaded_at = NOW() WHERE id = ?`,
+    [exportRow.id]
+  );
+  await audit.write({
+    requestId: req.requestId,
+    actorUserId: actor.id,
+    actorRole: actor.role,
+    action: 'FILE_DOWNLOADED',
+    entityType: 'export',
+    entityId: exportRow.id,
+    description: `${actor.email} downloaded ${exportRow.export_type} for ${exportRow.job_number}`,
+    metadata: {
+      jobId: exportRow.job_id,
+      jobNumber: exportRow.job_number,
+      exportType: exportRow.export_type,
+    },
+    ipAddress: clientIp(req),
+    userAgent: req.headers['user-agent'],
+  });
+}
+
+module.exports = {
+  getInternalLists,
+  createInternalListUpload,
+  createMasterUpload,
+  createScrubJob,
+  listJobs,
+  getJob,
+  cancelJob,
+  restartJob,
+  getExportForDownload,
+  recordDownload,
+  downloadFilename,
+  createFileRecord,
+  validateUpload,
+  clientIp,
+};
