@@ -1,0 +1,35 @@
+
+
+# Local environment and secrets (commit sanitized templates only)
+.env
+.env.*
+*.env
+!.env.example
+!.env.sample
+!.env.template
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+
+# Dependencies, build caches, and local machine artifacts
+node_modules/
+.next/
+.nuxt/
+.turbo/
+.cache/
+.npm-cache/
+.vercel/
+coverage/
+*.tsbuildinfo
+*.log
+logs/
+.DS_Store
+Thumbs.db
+.idea/
+
+# Local database backups; keep schema and migration SQL tracked
+*_backup.sql
+*.dump
+*.sqlite
+*.sqlite3
